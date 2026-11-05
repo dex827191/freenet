@@ -20,7 +20,6 @@ const FILE_PATH = process.env.FILE_PATH || '.tmp';
 const SUB_PATH = process.env.SUB_PATH || 'sub';
 
 const PORT = process.env.PORT || 8081;
-const UUID = process.env.UUID || '1f37ac4f-fdd0-49df-9406-1eda70a1d512';
 const ARGO_PORT = 8001;
 const CFPORT = process.env.CFPORT || 443;
 const NAME = process.env.NAME || 'ddfathu';
@@ -44,8 +43,58 @@ let cachedSshOnline = "0 User";
 let cachedUserListDetails = "Semua user offline";
 
 if (!fs.existsSync(FILE_PATH)) {
-  fs.mkdirSync(FILE_PATH);
+  fs.mkdirSync(FILE_PATH, { recursive: true });
 }
+
+// ========================================================
+// UUID AUTO-GENERATION & PERSISTENCE
+// ========================================================
+const UUID_FILE = path.join(FILE_PATH, 'uuid.txt');
+
+/**
+ * Generate UUID v4 format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+ */
+function generateUUID() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+        const r = (Math.random() * 16) | 0;
+        const v = c === 'x' ? r : (r & 0x3) | 0x8;
+        return v.toString(16);
+    });
+}
+
+/**
+ * Ambil UUID dari file persistent. Jika belum ada → generate baru & simpan.
+ * ENV `UUID` masih di-support (opsional) untuk backward compatibility.
+ */
+function getOrCreateUUID() {
+    // Override via ENV (opsional — untuk deployment yang butuh UUID tetap)
+    if (process.env.UUID && process.env.UUID.trim()) {
+        console.log(`[UUID] Menggunakan UUID dari ENV: ${process.env.UUID.trim()}`);
+        return process.env.UUID.trim();
+    }
+    // Load dari file persistent
+    try {
+        if (fs.existsSync(UUID_FILE)) {
+            const saved = fs.readFileSync(UUID_FILE, 'utf8').trim();
+            // Validasi format UUID v4
+            if (/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(saved)) {
+                console.log(`[UUID] Loaded dari file: ${saved}`);
+                return saved;
+            }
+        }
+    } catch (e) {}
+    // Generate baru & simpan
+    const newUuid = generateUUID();
+    try {
+        fs.writeFileSync(UUID_FILE, newUuid);
+        console.log(`[UUID] ✨ Generated baru & disimpan: ${newUuid}`);
+    } catch (e) {
+        console.error(`[UUID] Gagal simpan file: ${e.message}`);
+    }
+    return newUuid;
+}
+
+let UUID = getOrCreateUUID();
 
 // ========================================================
 // CONFIG STORE HELPERS
@@ -804,6 +853,7 @@ server.on('upgrade', (req, socket, head) => {
 // ========================================================
 server.listen(PORT, () => {
     console.log(`[UI & Xray Gateway Engine] Running on port ${PORT}`);
+    console.log(`[UUID] Active UUID: ${UUID}`);
     generateConfig()
       .then(() => downloadFilesAndRun())
       .then(() => extractDomains())
