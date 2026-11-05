@@ -1,0 +1,99 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  html {
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+
+  body {
+    @apply bg-surface-container-low text-neutral-20 antialiased;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-neutral-70 rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-neutral-50;
+  }
+}
+
+@layer components {
+  .m3-card {
+    @apply bg-surface-container-lowest rounded-m3-md border border-neutral-90/60 shadow-sm transition-all duration-200;
+  }
+
+  .m3-card-elevated {
+    @apply bg-surface-container-lowest rounded-m3-lg border border-neutral-90/40 shadow-md transition-all duration-200;
+  }
+
+  .m3-field {
+    @apply bg-surface-container-high rounded-m3-sm border border-transparent px-4 py-3 text-sm text-neutral-10 outline-none transition-all duration-200 placeholder:text-neutral-60 focus:border-primary-60 focus:bg-surface-container-lowest focus:ring-2 focus:ring-primary-60/20;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .m3-btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-m3-full px-6 py-2.5 text-sm font-semibold transition-all duration-200 active:scale-95 disabled:opacity-40 disabled:pointer-events-none;
+  }
+
+  .m3-btn-filled {
+    @apply bg-primary-40 text-primary-100 hover:bg-primary-50 shadow-sm hover:shadow-md;
+  }
+
+  .m3-btn-tonal {
+    @apply bg-secondary-90 text-secondary-20 hover:bg-secondary-80;
+  }
+
+  .m3-btn-outlined {
+    @apply border border-neutral-70 bg-transparent text-neutral-20 hover:bg-neutral-95/60;
+  }
+
+  .m3-btn-text {
+    @apply bg-transparent text-primary-40 hover:bg-primary-95/50 px-3;
+  }
+
+  .m3-chip {
+    @apply inline-flex items-center gap-1.5 rounded-m3-full px-3 py-1.5 text-xs font-medium transition-all duration-200;
+  }
+
+  .m3-label {
+    @apply text-xs font-medium uppercase tracking-wide text-neutral-60;
+  }
+
+  .state-layer {
+    @apply relative overflow-hidden;
+  }
+
+  .state-layer::after {
+    content: '';
+    @apply absolute inset-0 bg-current opacity-0 transition-opacity duration-150 pointer-events-none;
+  }
+
+  .state-layer:hover::after {
+    @apply opacity-[0.08];
+  }
+
+  .state-layer:active::after {
+    @apply opacity-[0.12];
+  }
+}
