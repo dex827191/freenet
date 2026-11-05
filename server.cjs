@@ -22,7 +22,7 @@ const SUB_PATH = process.env.SUB_PATH || 'sub';
 const PORT = process.env.PORT || 8081;
 const ARGO_PORT = 8001;
 const CFPORT = process.env.CFPORT || 443;
-const NAME = process.env.NAME || 'ddfathu';
+const NAME = process.env.NAME || 'freedom';
 
 const LOG_PATH = path.join(FILE_PATH, "boot.log");
 const ZT_LOG_PATH = "/tmp/named_tunnel.log";
