@@ -1,5 +1,14 @@
 import { useState, useEffect, useCallback } from 'react';
-import { UserPlus, Trash2, Info, ShieldAlert, CheckCircle2 } from 'lucide-react';
+import {
+  UserPlus,
+  Trash2,
+  Info,
+  ShieldAlert,
+  CheckCircle2,
+  Eye,
+  EyeOff,
+  X,
+} from 'lucide-react';
 import type { SshUser } from '@/types';
 import {
   fetchAccounts,
@@ -26,6 +35,10 @@ export function CreateSsh({ isAdmin, adminToken, showToast }: CreateSshProps) {
   const [resultMsg, setResultMsg] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+
+  // ===== INFO PANEL STATE =====
+  const [selectedUser, setSelectedUser] = useState<SshUser | null>(null);
+  const [showInfo, setShowInfo] = useState(true);
 
   const loadAccounts = useCallback(async () => {
     try {
@@ -76,6 +89,9 @@ export function CreateSsh({ isAdmin, adminToken, showToast }: CreateSshProps) {
       if (data.status === 'success') {
         loadAccounts();
         showToast(`User ${deleteTarget} berhasil dihapus`, 'success');
+        if (selectedUser?.username === deleteTarget) {
+          setSelectedUser(null);
+        }
       } else {
         showToast(data.message, 'error');
       }
@@ -86,10 +102,8 @@ export function CreateSsh({ isAdmin, adminToken, showToast }: CreateSshProps) {
   };
 
   const showDetails = (user: SshUser) => {
-    showToast(
-      `Username: ${user.username} | Password: ${user.password || '-'} | IP: ${user.ip || 'Unknown'}`,
-      'info'
-    );
+    setSelectedUser(user);
+    setShowInfo(true);
   };
 
   return (
@@ -163,6 +177,73 @@ export function CreateSsh({ isAdmin, adminToken, showToast }: CreateSshProps) {
         )}
       </Card>
 
+      {/* ============================================ */}
+      {/* INFO PANEL (muncul di luar tabel, bisa toggle) */}
+      {/* ============================================ */}
+      {selectedUser && (
+        <div className="m3-card p-4 border-l-4 border-l-primary-50 animate-slide-up">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <Info size={16} className="text-primary-50" />
+              <h2 className="text-sm font-bold text-neutral-10">
+                Detail Akun <span className="text-primary-50">{selectedUser.username}</span>
+              </h2>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowInfo((v) => !v)}
+                className="m3-chip bg-surface-container-high text-neutral-10 hover:bg-surface-container-highest transition-colors"
+                aria-label={showInfo ? 'Hide detail' : 'Show detail'}
+              >
+                {showInfo ? <EyeOff size={12} /> : <Eye size={12} />}
+                <span className="ml-1">{showInfo ? 'Hide' : 'Show'}</span>
+              </button>
+              <button
+                onClick={() => setSelectedUser(null)}
+                className="m3-chip bg-error-90 text-error-20 hover:bg-error-80 transition-colors"
+                aria-label="Close"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          </div>
+
+          {showInfo && (
+            <div className="space-y-2 animate-slide-up">
+              {[
+                { label: 'Username', value: selectedUser.username },
+                { label: 'Password', value: selectedUser.password || '-' },
+                { label: 'IP Address', value: selectedUser.ip || 'Unknown' },
+                { label: 'Shell', value: selectedUser.shell || '-' },
+              ].map((row) => (
+                <div
+                  key={row.label}
+                  className="flex items-center gap-2 bg-surface-container-high rounded-m3-sm px-3 py-2"
+                >
+                  <span className="text-[10px] font-bold uppercase tracking-wide text-neutral-60 w-20 shrink-0">
+                    {row.label}
+                  </span>
+                  <span className="flex-1 font-mono text-xs font-semibold text-neutral-10 break-all">
+                    {row.value}
+                  </span>
+                  <CopyButton
+                    text={row.value}
+                    variant="text"
+                    label="Copy"
+                  />
+                </div>
+              ))}
+
+              <CopyButton
+                text={`Username: ${selectedUser.username}\nPassword: ${selectedUser.password || '-'}\nIP: ${selectedUser.ip || 'Unknown'}\nShell: ${selectedUser.shell || '-'}`}
+                label="Copy Semua Detail"
+                className="w-full mt-2"
+              />
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Account List */}
       <Card>
         <SectionTitle>Daftar Akun Terdaftar</SectionTitle>
@@ -190,7 +271,11 @@ export function CreateSsh({ isAdmin, adminToken, showToast }: CreateSshProps) {
                 {users.map((user) => (
                   <tr
                     key={user.username}
-                    className="border-b border-neutral-95/50 hover:bg-surface-container-low/60 transition-colors"
+                    className={cn(
+                      'border-b border-neutral-95/50 hover:bg-surface-container-low/60 transition-colors',
+                      selectedUser?.username === user.username &&
+                        'bg-primary-95/60 border-l-2 border-l-primary-50'
+                    )}
                   >
                     <td className="py-2.5 px-3 font-semibold text-neutral-10">
                       {user.username}
@@ -202,7 +287,12 @@ export function CreateSsh({ isAdmin, adminToken, showToast }: CreateSshProps) {
                       <div className="flex items-center gap-2 justify-end">
                         <button
                           onClick={() => showDetails(user)}
-                          className="m3-chip bg-success-90 text-success-20 hover:bg-success-80 state-layer"
+                          className={cn(
+                            'm3-chip state-layer',
+                            selectedUser?.username === user.username
+                              ? 'bg-primary-80 text-white'
+                              : 'bg-success-90 text-success-20 hover:bg-success-80'
+                          )}
                         >
                           <Info size={12} /> Info
                         </button>
