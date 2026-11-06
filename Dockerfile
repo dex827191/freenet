@@ -1,5 +1,5 @@
 # =================================================================
-# STAGE 1: Builder BadVPN (UDP Gateway)
+# STAGE 1: Builder BadVPN
 # =================================================================
 FROM ubuntu:22.04 AS badvpn-builder
 ENV DEBIAN_FRONTEND=noninteractive
@@ -12,7 +12,7 @@ RUN curl -fsSL https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.130.ta
  && make badvpn-udpgw
 
 # =================================================================
-# STAGE 2: Frontend React (Vite build)
+# STAGE 2: Frontend React
 # =================================================================
 FROM node:20-slim AS frontend
 WORKDIR /web
@@ -22,7 +22,7 @@ COPY . .
 RUN npm run build
 
 # =================================================================
-# STAGE 3: Go Binaries (wsproxy — mux DIHAPUS, digantikan Nginx)
+# STAGE 3: Go Binary (wsproxy saja — mux dihapus)
 # =================================================================
 FROM golang:1.22-bookworm AS go-builder
 WORKDIR /build
@@ -31,7 +31,7 @@ COPY cmd/ ./cmd/
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/wsproxy ./cmd/wsproxy
 
 # =================================================================
-# STAGE 4: Runtime — Ubuntu 22.04 + nginx-full + libnginx-mod-stream
+# STAGE 4: Runtime
 # =================================================================
 FROM ubuntu:22.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
@@ -40,8 +40,6 @@ ENV PORT=8081
 WORKDIR /app
 
 # ── Paket sistem ──
-# ⚠️ WAJIB: nginx-full + libnginx-mod-stream
-# libnginx-mod-stream menyediakan file ngx_stream_module.so
 RUN apt-get update && apt-get install -y \
     dropbear \
     nginx-full \
@@ -53,33 +51,31 @@ RUN apt-get update && apt-get install -y \
     curl wget \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Verifikasi: pastikan file modul stream benar-benar ada ──
+# ── Verifikasi: hanya cek file .so-nya ada (dynamic module) ──
 RUN test -f /usr/lib/nginx/modules/ngx_stream_module.so \
     || (echo "❌ ngx_stream_module.so tidak ditemukan!" && exit 1)
-RUN nginx -V 2>&1 | grep -q 'with-stream' \
-    || (echo "❌ Nginx tidak dikompilasi dengan stream!" && exit 1)
 
-# ── Node.js 20 (untuk panel UI server.cjs) ──
+# ── Node.js 20 ──
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get install -y nodejs \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ── Cloudflared (tunnel ke panel/xray) ──
+# ── Cloudflared ──
 RUN curl -fsSL -o /usr/local/bin/cloudflared \
     https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
  && chmod +x /usr/local/bin/cloudflared
 
-# ── BadVPN dari builder ──
+# ── BadVPN ──
 COPY --from=badvpn-builder \
      /src/badvpn-1.999.130/build/udpgw/badvpn-udpgw \
      /usr/local/bin/badvpn-udpgw
 RUN chmod +x /usr/local/bin/badvpn-udpgw
 
-# ── WSProxy dari Go builder ──
+# ── WSProxy ──
 COPY --from=go-builder /out/wsproxy /usr/local/bin/wsproxy
 RUN chmod +x /usr/local/bin/wsproxy
 
-# ── Dependensi Node panel ──
+# ── Node deps ──
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
 
@@ -91,7 +87,7 @@ COPY --from=frontend /web/dist ./dist
 RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/*.conf
 COPY nginx/nginx.conf /etc/nginx/nginx.conf
 
-# ── Siapkan folder & sertifikat self-signed untuk SNI bug ──
+# ── Sertifikat + folder log ──
 RUN chmod +x /app/start.sh \
  && mkdir -p /var/run /var/log/nginx /var/run/dropbear /etc/dropbear /etc/nginx/ssl \
  && openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
