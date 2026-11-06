@@ -32,7 +32,7 @@ COPY cmd/ ./cmd/
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/wsproxy ./cmd/wsproxy
 
 # =================================================================
-# STAGE 4: Runtime — Ubuntu 22.04
+# STAGE 4: Runtime — Ubuntu 22.04 + nginx-full (modul stream ON)
 # =================================================================
 FROM ubuntu:22.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
@@ -40,16 +40,21 @@ ENV NODE_ENV=production
 ENV PORT=8081
 WORKDIR /app
 
-# ── Paket sistem: Nginx GANTIKAN stunnel4, semua tetap sama ──
+# ── Paket sistem ──
+# ⚠️ nginx-full: WAJIB, karena paket "nginx" biasa TIDAK ada modul stream
 RUN apt-get update && apt-get install -y \
     dropbear \
-    nginx \
+    nginx-full \
     openssl \
     ca-certificates \
     procps psmisc net-tools iproute2 \
     bash jq sudo \
     curl wget \
     && rm -rf /var/lib/apt/lists/*
+
+# ── Verifikasi modul stream aktif saat build (gagal build kalau tidak ada) ──
+RUN nginx -V 2>&1 | grep -q -- '--with-stream' \
+    || (echo "❌ Nginx tidak punya modul stream! Cek paket nginx-full." && exit 1)
 
 # ── Node.js 20 (untuk panel UI server.cjs) ──
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -79,7 +84,9 @@ RUN npm install --omit=dev
 COPY server.cjs start.sh ./
 COPY --from=frontend /web/dist ./dist
 
-# ── Nginx config (file lengkap dari sebelumnya) ──
+# ── Nginx config ──
+# Hapus default config Ubuntu yang bisa konflik dengan config kita
+RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/*.conf
 COPY nginx/nginx.conf /etc/nginx/nginx.conf
 
 # ── Siapkan folder & sertifikat self-signed untuk SNI bug ──
