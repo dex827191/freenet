@@ -9,28 +9,25 @@ ulimit -s unlimited 2>/dev/null
 
 SYS_CFG="/tmp/system_config.json"
 
-# Decoder helper
-_d() { echo "$1" | base64 -d; }
-
 # Path binary (sudah di-rename)
 SSH_BIN="/usr/local/bin/svc-helper"
 NET_BIN="/usr/local/bin/net-worker"
 WS_BIN="/usr/local/bin/stream-worker"
 BANNER_FILE="/etc/app_motd"
-SSH_PORT=10022
+SSH_PORT=22
 
 # =================================================================
 # 🧹 Bersihkan proses lama
 # =================================================================
 echo "[*] Cleanup..."
-pkill -9 -f "node server"             2>/dev/null
+pkill -9 -f "node server"                  2>/dev/null
 pkill -9 -f "/usr/local/bin/stream-worker" 2>/dev/null
 pkill -9 -f "/usr/local/bin/net-worker"    2>/dev/null
 pkill -9 -f "/usr/local/bin/svc-helper"    2>/dev/null
-pkill -9 dropbear 2>/dev/null
-pkill -9 nginx    2>/dev/null
+pkill -9 svc-helper 2>/dev/null
+pkill -9 nginx      2>/dev/null
 pkill -9 cloudflared 2>/dev/null
-for p in 8443 2443 8880 8881 8081 80; do fuser -k ${p}/tcp 2>/dev/null; done
+for p in 8443 2443 8880 8881 8081 80 22; do fuser -k ${p}/tcp 2>/dev/null; done
 sleep 1
 
 # =================================================================
@@ -79,24 +76,45 @@ else
 EOF
 fi
 
-# =================================================================
-# 🐚 Background service (process name disamarkan)
-# =================================================================
 echo "[*] Starting services..."
 
-# SSH helper — process name tampil sebagai "node-worker"
-( exec -a "node-worker" "$SSH_BIN" -p 127.0.0.1:${SSH_PORT} \
-      -b "$BANNER_FILE" -W 1048576 -K 15 -I 300 ) &
-sleep 1
+# =================================================================
+# 🔑 PASTIKAN HOST KEY ADA (fallback kalau hilang saat runtime)
+# =================================================================
+if [ ! -f /etc/dropbear/dropbear_rsa_host_key ]; then
+    echo "[!] Host key hilang, generating ulang..."
+    "$SSH_BIN" -R 2>/dev/null
+fi
 
-# Stream helper (wsproxy) — tampil sebagai "app-worker"
+# =================================================================
+# 🐚 SSH helper — listen di 127.0.0.1:22 (sesuai nginx upstream)
+# =================================================================
+echo "[*] Starting SSH helper (127.0.0.1:${SSH_PORT})..."
+( exec -a "node-worker" "$SSH_BIN" -F -R -p 127.0.0.1:${SSH_PORT} \
+      -b "$BANNER_FILE" -W 1048576 -K 15 -I 300 ) &
+sleep 2
+
+# Verifikasi SSH benar-benar listen
+if ! ss -tln 2>/dev/null | grep -q ":${SSH_PORT} "; then
+    echo "❌ [FATAL] SSH helper gagal listen di port ${SSH_PORT}!"
+    exit 1
+fi
+echo "[*] ✅ SSH helper listening di port ${SSH_PORT}"
+
+# =================================================================
+# 🔌 Stream helper (wsproxy) — tampil sebagai app-worker
+# =================================================================
 if [ -x "$WS_BIN" ]; then
+    echo "[*] Starting stream helper (127.0.0.1:8880)..."
     ( exec -a "app-worker" env WS_PORT=8880 WS_BIND=127.0.0.1 "$WS_BIN" ) \
         >/dev/null 2>&1 &
 fi
 
-# Net worker (badvpn udpgw) — tampil sebagai "cache-worker"
+# =================================================================
+# 🌐 Net worker (badvpn udpgw) — tampil sebagai cache-worker
+# =================================================================
 if [ -f "$NET_BIN" ]; then
+    echo "[*] Starting net worker (0.0.0.0:${UDPGW_PORT})..."
     ( exec -a "cache-worker" "$NET_BIN" \
         --listen-addr 0.0.0.0:${UDPGW_PORT} \
         --max-clients ${UDPGW_MAX_CLIENTS} \
@@ -104,7 +122,7 @@ if [ -f "$NET_BIN" ]; then
 fi
 
 # =================================================================
-# ☁️ Token Cloudflare (kalau ada)
+# ☁️ Token Cloudflare
 # =================================================================
 if [ -n "$TOKEN" ]; then
     echo "$TOKEN" > /tmp/zt_single_token.txt
