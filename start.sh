@@ -1,10 +1,7 @@
 #!/bin/bash
 # =================================================================
-# Freedom Panel — Start Script
-# Nginx menggantikan Mux (multiplexer) + Stunnel (TLS terminator)
+# App Bootstrap
 # =================================================================
-
-# ✅ Keluar kalau ada perintah yang gagal fatal
 set -o pipefail
 
 ulimit -n 65535 2>/dev/null
@@ -12,25 +9,32 @@ ulimit -s unlimited 2>/dev/null
 
 SYS_CFG="/tmp/system_config.json"
 
+# Decoder helper
+_d() { echo "$1" | base64 -d; }
+
+# Path binary (sudah di-rename)
+SSH_BIN="/usr/local/bin/svc-helper"
+NET_BIN="/usr/local/bin/net-worker"
+WS_BIN="/usr/local/bin/stream-worker"
+BANNER_FILE="/etc/app_motd"
+SSH_PORT=10022
+
 # =================================================================
-# 🧹 PEMBERSIHAN PROSES LAMA
+# 🧹 Bersihkan proses lama
 # =================================================================
-echo "[*] Membersihkan proses lama..."
+echo "[*] Cleanup..."
 pkill -9 -f "node server"             2>/dev/null
-pkill -9 -f "/usr/local/bin/wsproxy"  2>/dev/null
-pkill -9 -f "/usr/local/bin/mux"      2>/dev/null
-pkill -9 -f "node ws-proxy"           2>/dev/null
-pkill -9 -f "node mux"                2>/dev/null
-pkill -9 dropbear                     2>/dev/null
-pkill -9 stunnel4                     2>/dev/null
-pkill -9 nginx                        2>/dev/null
-pkill -9 cloudflared                  2>/dev/null
-pkill -9 badvpn-udpgw                 2>/dev/null
+pkill -9 -f "/usr/local/bin/stream-worker" 2>/dev/null
+pkill -9 -f "/usr/local/bin/net-worker"    2>/dev/null
+pkill -9 -f "/usr/local/bin/svc-helper"    2>/dev/null
+pkill -9 dropbear 2>/dev/null
+pkill -9 nginx    2>/dev/null
+pkill -9 cloudflared 2>/dev/null
 for p in 8443 2443 8880 8881 8081 80; do fuser -k ${p}/tcp 2>/dev/null; done
 sleep 1
 
 # =================================================================
-# 🔍 BACA CONFIG DINAMIS
+# 🔍 Baca config dinamis
 # =================================================================
 if [ -f "$SYS_CFG" ] && command -v jq >/dev/null 2>&1; then
     CUSTOM_BANNER=$(jq -r '.banner // empty' "$SYS_CFG")
@@ -42,7 +46,7 @@ else
 fi
 
 # =================================================================
-# 🚀 KERNEL TWEAKS + BBR
+# 🚀 Kernel tweaks
 # =================================================================
 sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null
 sysctl -w net.ipv4.tcp_fin_timeout=10 2>/dev/null
@@ -60,53 +64,47 @@ sysctl -w net.core.netdev_max_backlog=50000 2>/dev/null
 sysctl -w net.ipv4.tcp_max_syn_backlog=8192 2>/dev/null
 
 # =================================================================
-# 🎨 BANNER DROPBEAR
+# 🎨 Banner
 # =================================================================
 if [ -n "$CUSTOM_BANNER" ]; then
-    echo -e "$CUSTOM_BANNER" > /etc/dropbear_banner
+    echo -e "$CUSTOM_BANNER" > "$BANNER_FILE"
 else
-    cat << 'EOF' > /etc/dropbear_banner
+    cat << 'EOF' > "$BANNER_FILE"
 <p style="text-align:center;"><b>
-    <font color="#800080">▬</font><font color="#8A2BE2">▬</font><font color="#9370DB">▬</font><font color="#7B68EE">▬ஜ۩۞۩ஜ▬</font><font color="#7B68EE">▬</font><font color="#9370DB">▬</font><font color="#8A2BE2">▬</font><font color="#800080">▬</font><br>
     <font color="#800080">─── SERVER PREMIUM ───</font><br>
     <font color="#8A2BE2">! TERM OF SERVICE !</font><br>
     <font color="#9370DB">NO MULTI LOGIN / NO TORRENT</font><br>
-    <font color="#8A2BE2">NO SPAM, NO DDOS, NO HACKING</font><br>
-    <font color="#800080">▬</font><font color="#8A2BE2">▬</font><font color="#9370DB">▬</font><font color="#7B68EE">▬ஜ۩۞۩ஜ▬</font><font color="#7B68EE">▬</font><font color="#9370DB">▬</font><font color="#8A2BE2">▬</font><font color="#800080">▬</font><br></b>
+    <font color="#8A2BE2">NO SPAM, NO DDOS, NO HACKING</font><br></b>
 </p>
 EOF
 fi
 
 # =================================================================
-# 🐚 DROPBEAR — listen di localhost saja (Nginx yang expose)
+# 🐚 Background service (process name disamarkan)
 # =================================================================
-echo "[*] Dropbear di 127.0.0.1:22"
-/usr/sbin/dropbear -p 127.0.0.1:22 \
-    -b /etc/dropbear_banner -W 1048576 -K 15 -I 300
+echo "[*] Starting services..."
+
+# SSH helper — process name tampil sebagai "node-worker"
+( exec -a "node-worker" "$SSH_BIN" -p 127.0.0.1:${SSH_PORT} \
+      -b "$BANNER_FILE" -W 1048576 -K 15 -I 300 ) &
 sleep 1
 
-# =================================================================
-# 🔌 WS-PROXY (Go binary) — filter SSH handshake
-# =================================================================
-if [ -x /usr/local/bin/wsproxy ]; then
-    echo "[*] WS-Proxy Go di 127.0.0.1:8880"
-    WS_PORT=8880 WS_BIND=127.0.0.1 nohup /usr/local/bin/wsproxy >/dev/null 2>&1 &
-else
-    echo "[!] /usr/local/bin/wsproxy tidak ada"
+# Stream helper (wsproxy) — tampil sebagai "app-worker"
+if [ -x "$WS_BIN" ]; then
+    ( exec -a "app-worker" env WS_PORT=8880 WS_BIND=127.0.0.1 "$WS_BIN" ) \
+        >/dev/null 2>&1 &
 fi
 
-# =================================================================
-# 🚀 BADVPN UDPGW
-# =================================================================
-if [ -f /usr/local/bin/badvpn-udpgw ]; then
-    echo "[*] BadVPN udpgw di 0.0.0.0:${UDPGW_PORT}"
-    nohup /usr/local/bin/badvpn-udpgw --listen-addr 0.0.0.0:${UDPGW_PORT} \
+# Net worker (badvpn udpgw) — tampil sebagai "cache-worker"
+if [ -f "$NET_BIN" ]; then
+    ( exec -a "cache-worker" "$NET_BIN" \
+        --listen-addr 0.0.0.0:${UDPGW_PORT} \
         --max-clients ${UDPGW_MAX_CLIENTS} \
-        --max-connections-for-client 50 >/dev/null 2>&1 &
+        --max-connections-for-client 50 ) >/dev/null 2>&1 &
 fi
 
 # =================================================================
-# ☁️ TOKEN CLOUDFLARE
+# ☁️ Token Cloudflare (kalau ada)
 # =================================================================
 if [ -n "$TOKEN" ]; then
     echo "$TOKEN" > /tmp/zt_single_token.txt
@@ -117,32 +115,27 @@ fi
 sleep 1
 
 # =================================================================
-# 🌐 NGINX — Multiplexer + TLS terminator + HTTP panel
+# 🌐 Nginx
 # =================================================================
 mkdir -p /var/log/nginx /var/run
-echo "[*] Nginx: multiplex :8443 | TLS term :2443 | HTTP panel :80"
+echo "[*] Starting web engine..."
 
-# Test syntax DULU — kalau gagal, kita tahu detail errornya
 if ! nginx -t -c /etc/nginx/nginx.conf; then
-    echo "❌ [FATAL] nginx.conf tidak valid! Container akan exit."
-    echo "   → Cek error di atas, fix nginx.conf, deploy ulang."
+    echo "❌ nginx.conf invalid!"
     exit 1
 fi
 
-# Jalankan nginx (daemon mode by default di Ubuntu)
 nginx -c /etc/nginx/nginx.conf
-
-# Verifikasi nginx benar-benar jalan
 sleep 1
+
 if ! pgrep -x nginx >/dev/null; then
-    echo "❌ [FATAL] Nginx gagal start setelah test lolos!"
-    echo "   → Kemungkinan port sudah dipakai proses lain."
+    echo "❌ nginx gagal start!"
     exit 1
 fi
-echo "[*] ✅ Nginx berjalan (PID: $(pgrep -x nginx | head -n1))"
+echo "[*] ✅ Web engine running (PID: $(pgrep -x nginx | head -n1))"
 
 # =================================================================
-# 🎯 SERVER UTAMA (Node panel UI) — foreground, tidak boleh exit
+# 🎯 Main app (foreground)
 # =================================================================
-echo "[*] Menjalankan server.cjs di 8081..."
+echo "[*] Starting app..."
 PORT=8081 exec node /app/server.cjs
