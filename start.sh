@@ -1,7 +1,11 @@
 #!/bin/bash
 # =================================================================
-# Freedom Panel — Start Script (Nginx replaces Mux + Stunnel)
+# Freedom Panel — Start Script
+# Nginx menggantikan Mux (multiplexer) + Stunnel (TLS terminator)
 # =================================================================
+
+# ✅ Keluar kalau ada perintah yang gagal fatal
+set -o pipefail
 
 ulimit -n 65535 2>/dev/null
 ulimit -s unlimited 2>/dev/null
@@ -74,31 +78,15 @@ EOF
 fi
 
 # =================================================================
-# 🔒 SSL SERTIFIKAT (self-signed, untuk SNI bug host)
+# 🐚 DROPBEAR — listen di localhost saja (Nginx yang expose)
 # =================================================================
-SSL_INTERNAL_PORT="2443"      # Nginx TLS terminator
-SSH_PORT_LOCAL="22"
-
-mkdir -p /etc/nginx/ssl
-if [ ! -f /etc/nginx/ssl/server.crt ]; then
-    openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
-        -subj "/C=ID/ST=Jakarta/L=Jakarta/O=RailwaySSH/CN=bug.com" \
-        -keyout /etc/nginx/ssl/server.key \
-        -out    /etc/nginx/ssl/server.crt 2>/dev/null
-    chmod 600 /etc/nginx/ssl/server.key
-    echo "[*] Self-signed cert dibuat (SNI bug host ready)"
-fi
-
-# =================================================================
-# 🐚 DROPBEAR
-# =================================================================
-echo "[*] Dropbear di 127.0.0.1:${SSH_PORT_LOCAL}"
-/usr/sbin/dropbear -p 127.0.0.1:${SSH_PORT_LOCAL} \
+echo "[*] Dropbear di 127.0.0.1:22"
+/usr/sbin/dropbear -p 127.0.0.1:22 \
     -b /etc/dropbear_banner -W 1048576 -K 15 -I 300
 sleep 1
 
 # =================================================================
-# 🔌 WS-PROXY (Go binary) — filter SSH handshake, dipanggil dari Nginx
+# 🔌 WS-PROXY (Go binary) — filter SSH handshake
 # =================================================================
 if [ -x /usr/local/bin/wsproxy ]; then
     echo "[*] WS-Proxy Go di 127.0.0.1:8880"
@@ -108,7 +96,7 @@ else
 fi
 
 # =================================================================
-# 🚀 BADVPN UDPGW (UDP Gaming — TCP proxy Railway tidak support UDP)
+# 🚀 BADVPN UDPGW
 # =================================================================
 if [ -f /usr/local/bin/badvpn-udpgw ]; then
     echo "[*] BadVPN udpgw di 0.0.0.0:${UDPGW_PORT}"
@@ -118,7 +106,7 @@ if [ -f /usr/local/bin/badvpn-udpgw ]; then
 fi
 
 # =================================================================
-# ☁️ TOKEN CLOUDFLARE → server.cjs
+# ☁️ TOKEN CLOUDFLARE
 # =================================================================
 if [ -n "$TOKEN" ]; then
     echo "$TOKEN" > /tmp/zt_single_token.txt
@@ -129,21 +117,32 @@ fi
 sleep 1
 
 # =================================================================
-# 🌐 NGINX — Multiplexer (:8443) + TLS Terminator (:2443) + Panel (:80)
+# 🌐 NGINX — Multiplexer + TLS terminator + HTTP panel
 # =================================================================
 mkdir -p /var/log/nginx /var/run
-if [ -x /usr/sbin/nginx ] || command -v nginx >/dev/null 2>&1; then
-    echo "[*] Nginx: multiplex :8443 | TLS term :2443 | HTTP panel :80"
-    nginx -c /etc/nginx/nginx.conf -t 2>&1 | grep -v "syntax is ok" || true
-    nginx -c /etc/nginx/nginx.conf
-else
-    echo "[!] Nginx tidak terinstall!"
+echo "[*] Nginx: multiplex :8443 | TLS term :2443 | HTTP panel :80"
+
+# Test syntax DULU — kalau gagal, kita tahu detail errornya
+if ! nginx -t -c /etc/nginx/nginx.conf; then
+    echo "❌ [FATAL] nginx.conf tidak valid! Container akan exit."
+    echo "   → Cek error di atas, fix nginx.conf, deploy ulang."
+    exit 1
 fi
 
+# Jalankan nginx (daemon mode by default di Ubuntu)
+nginx -c /etc/nginx/nginx.conf
+
+# Verifikasi nginx benar-benar jalan
 sleep 1
+if ! pgrep -x nginx >/dev/null; then
+    echo "❌ [FATAL] Nginx gagal start setelah test lolos!"
+    echo "   → Kemungkinan port sudah dipakai proses lain."
+    exit 1
+fi
+echo "[*] ✅ Nginx berjalan (PID: $(pgrep -x nginx | head -n1))"
 
 # =================================================================
-# 🎯 SERVER UTAMA (Node panel UI) — last, karena foreground
+# 🎯 SERVER UTAMA (Node panel UI) — foreground, tidak boleh exit
 # =================================================================
 echo "[*] Menjalankan server.cjs di 8081..."
 PORT=8081 exec node /app/server.cjs
