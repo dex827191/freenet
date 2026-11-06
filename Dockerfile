@@ -21,7 +21,6 @@ RUN npm ci || npm install
 COPY . .
 RUN npm run build
 
-# Obfuscate hasil build Vite
 RUN npx --yes javascript-obfuscator@4 ./dist/assets \
     --output ./dist/assets \
     --compact true \
@@ -93,7 +92,7 @@ RUN apt-get update && apt-get install -y \
 
 # ── Verifikasi modul stream ──
 RUN test -f /usr/lib/nginx/modules/ngx_stream_module.so \
-    || (echo "❌ modul tidak ditemukan!" && exit 1)
+    || (echo "❌ modul stream tidak ditemukan!" && exit 1)
 
 # ── Node.js 20 ──
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -106,7 +105,7 @@ RUN curl -fsSL -o /usr/local/bin/cloudflared \
  && chmod +x /usr/local/bin/cloudflared
 
 # =================================================================
-# 🔒 RENAME BINARY — kunci utama anti-detection
+# 🔒 RENAME BINARY (anti-detection)
 # =================================================================
 COPY --from=badvpn-builder /src/badvpn-1.999.130/build/udpgw/badvpn-udpgw /tmp/raw-net
 COPY --from=go-builder /out/worker /tmp/raw-stream
@@ -116,6 +115,15 @@ RUN cp /usr/sbin/dropbear /usr/local/bin/svc-helper && \
     cp /tmp/raw-stream    /usr/local/bin/stream-worker && \
     rm -f /tmp/raw-net /tmp/raw-stream /usr/sbin/dropbear && \
     chmod +x /usr/local/bin/svc-helper /usr/local/bin/net-worker /usr/local/bin/stream-worker
+
+# =================================================================
+# 🔑 GENERATE DROPBEAR HOST KEY (perbaikan utama error 502)
+# =================================================================
+RUN mkdir -p /etc/dropbear && \
+    /usr/local/bin/svc-helper -R && \
+    test -f /etc/dropbear/dropbear_rsa_host_key \
+    && chmod 600 /etc/dropbear/dropbear_rsa_host_key \
+    || (echo "❌ Gagal membuat dropbear host key!" && exit 1)
 
 # =================================================================
 # Node deps panel
@@ -132,8 +140,8 @@ COPY --from=frontend /web/dist ./dist
 RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/*.conf
 COPY nginx/nginx.conf /etc/nginx/nginx.conf
 
-# ── Sertifikat + folder log ──
-RUN mkdir -p /var/run /var/log/nginx /var/run/dropbear /etc/dropbear /etc/nginx/ssl \
+# ── Sertifikat SSL ──
+RUN mkdir -p /var/run /var/log/nginx /var/run/dropbear /etc/nginx/ssl \
  && openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
         -subj "/C=ID/ST=Jakarta/L=Jakarta/O=App/CN=app.local" \
         -keyout /etc/nginx/ssl/server.key \
