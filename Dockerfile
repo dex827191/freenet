@@ -19,7 +19,7 @@ RUN curl -fsSL https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.130.ta
 FROM node:20-slim AS frontend
 WORKDIR /web
 
-# ---- 2a) dependency (WAJIB: dev deps untuk vite, javascript-obfuscator) ----
+# ── 2a) Install SEMUA deps (dev + prod) ──
 COPY package.json package-lock.json* ./
 RUN if [ -f package-lock.json ]; then \
         npm ci --include=dev --no-audit --no-fund; \
@@ -27,17 +27,19 @@ RUN if [ -f package-lock.json ]; then \
         npm install --include=dev --no-audit --no-fund; \
     fi
 
-# ---- 2b) copy semua sumber ----
-#  ⚠️  `COPY . .` aman HANYA jika .dockerignore ada dan mengecualikan node_modules/
+# ── 2b) Copy semua sumber ──
+#      ⚠️  Pastikan .dockerignore TIDAK mengecualikan:
+#          scripts/, src/, public/, dist/, index.html
 COPY . .
 
-# ---- 2c) build Vite ----
+# ── 2c) Build Vite + verifikasi output ──
 RUN npm run build \
- && echo "=== dist/ ===" && ls -la dist/ \
- && echo "=== dist/assets/ ===" && ls -la dist/assets/ \
- && test -f dist/index.html
+ && echo "=== ls dist/ ===" && ls -la dist/ \
+ && echo "=== ls dist/assets/ ===" && ls -la dist/assets/ \
+ && test -f dist/index.html \
+ || (echo "❌ npm run build gagal / dist/index.html tidak ada" && exit 1)
 
-# ---- 2d) obfuscate JS asset ----
+# ── 2d) Obfuscate JS assets ──
 RUN npx --yes javascript-obfuscator@4 ./dist/assets \
     --output ./dist/assets \
     --compact true \
@@ -52,10 +54,11 @@ RUN npx --yes javascript-obfuscator@4 ./dist/assets \
     --control-flow-flattening false \
     --dead-code-injection false \
     --identifier-names-generator hexadecimal \
- && echo "=== dist/assets setelah obfuscate ===" && ls -la dist/assets/
+ && echo "=== assets setelah obfuscate ===" && ls -la dist/assets/
 
-# ---- 2e) inline CSS+JS+favicon → frontend.html.cjs ----
-RUN node --trace-warnings scripts/inline-html.js \
+# ── 2e) Inline CSS+JS+favicon → frontend.html.cjs ──
+#      ⚠️  PENTING: panggil .mjs (bukan .js)
+RUN node --trace-warnings scripts/inline-html.mjs \
  && echo "=== frontend.html.cjs ===" \
  && ls -la frontend.html.cjs \
  && wc -c frontend.html.cjs
