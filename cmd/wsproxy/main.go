@@ -24,6 +24,7 @@ const (
 	HeaderReadLimit     = 32 * 1024
 	HeaderReadTimeout   = 10 * time.Second
 	ProbeTimeout        = 500 * time.Millisecond
+	SplitProbeTimeout   = 200 * time.Millisecond // ✨ probe untuk [split] yang terfragmentasi
 )
 
 type ProxyConfig struct {
@@ -80,10 +81,11 @@ func parseHeaders(raw string) map[string]string {
 	return headers
 }
 
-// readHttpHeaders mendukung 3 format:
+// readHttpHeaders mendukung 4 format:
 //  1. HTTP standar (akhir header: \r\n\r\n)
 //  2. WebSocket sederhana dengan [crlf] (akhir: [crlf][crlf])
 //  3. Pylod Enhanced (decoy + WS + [split] + fake response)
+//  4. Pylod Enhanced dengan [protocol] & trailing berisi Sec-WebSocket-Key
 func readHttpHeaders(conn net.Conn) (string, []byte, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(HeaderReadTimeout))
 	defer conn.SetReadDeadline(time.Time{})
@@ -92,12 +94,14 @@ func readHttpHeaders(conn net.Conn) (string, []byte, error) {
 	tmp := make([]byte, 4096)
 	wsMarkerEnd := -1
 	probed := false
+	splitProbed := false // ✨
 
 	for {
 		n, err := conn.Read(tmp)
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
 			probed = false
+			splitProbed = false // ✨
 
 			// PRIORITAS 1: [split] = penanda akhir payload Pylod Enhanced
 			if idx := bytes.Index(buf, []byte("[split]")); idx != -1 {
@@ -118,6 +122,25 @@ func readHttpHeaders(conn net.Conn) (string, []byte, error) {
 				// PRIORITAS 2: header end SETELAH marker WS (hindari decoy)
 				if subIdx := bytes.Index(buf[wsMarkerEnd:], []byte("[crlf][crlf]")); subIdx != -1 {
 					end := wsMarkerEnd + subIdx + len("[crlf][crlf]")
+
+					// ✨ Jika pola multi-block (decoy + WS) & end persis di ujung buffer,
+					// probe singkat agar [split] yang datang terpisah tetap tertangkap.
+					isMultiBlock := bytes.Contains(buf[:wsMarkerEnd], []byte("[crlf][crlf]")) ||
+						bytes.Contains(buf[:wsMarkerEnd], []byte("\r\n\r\n"))
+					if isMultiBlock && end == len(buf) && !splitProbed {
+						splitProbed = true
+						_ = conn.SetReadDeadline(time.Now().Add(SplitProbeTimeout))
+						n2, _ := conn.Read(tmp)
+						_ = conn.SetReadDeadline(time.Now().Add(HeaderReadTimeout))
+						if n2 > 0 {
+							buf = append(buf, tmp[:n2]...)
+							if idx := bytes.Index(buf, []byte("[split]")); idx != -1 {
+								return string(buf[:idx]), buf[idx+len("[split]"):], nil
+							}
+							// fallback: pakai data yang sudah ada
+							end = wsMarkerEnd + bytes.Index(buf[wsMarkerEnd:], []byte("[crlf][crlf]")) + len("[crlf][crlf]")
+						}
+					}
 					return string(buf[:end]), buf[end:], nil
 				}
 				if subIdx := bytes.Index(buf[wsMarkerEnd:], []byte("\r\n\r\n")); subIdx != -1 {
@@ -220,8 +243,19 @@ func handleWS(client net.Conn, cfg ProxyConfig) {
 	isWsUpgrade := strings.Contains(rawLower, "upgrade:websocket") ||
 		strings.Contains(rawLower, "upgrade: websocket")
 
+	// ✨ Ekstrak Sec-WebSocket-Key: prioritas dari request, fallback ke trailing.
+	//    Pylod Enhanced sering menyelipkan key di fake response setelah [split].
+	wsKey := headers["sec-websocket-key"]
+	trailingNorm := ""
+	if len(trailing) > 0 {
+		trailingNorm = strings.ReplaceAll(string(trailing), "[crlf]", "\r\n")
+		if wsKey == "" {
+			trailingHeaders := parseHeaders(trailingNorm)
+			wsKey = trailingHeaders["sec-websocket-key"]
+		}
+	}
+
 	if isWsUpgrade {
-		wsKey := headers["sec-websocket-key"]
 		if wsKey == "" {
 			wsKey = genWsKey()
 		}
@@ -259,14 +293,22 @@ func handleWS(client net.Conn, cfg ProxyConfig) {
 	defer sshConn.Close()
 	tweakSocket(sshConn, cfg.KeepAlive)
 
-	// Preserve trailing bytes; buang fake HTTP response dari Pylod Enhanced
+	// ✨ Preserve trailing bytes: buang fake HTTP response (HTTP/, HTTP/enhanced),
+	//    tapi pertahankan sisa data setelah "\r\n\r\n" (bisa jadi SSH data yang menyusul).
 	pending := make([]byte, 0, cfg.MaxBuffer)
-	if len(trailing) > 0 {
-		trailingNorm := strings.ReplaceAll(string(trailing), "[crlf]", "\r\n")
-		trimmed := strings.TrimSpace(trailingNorm)
-		// Fake response seperti "HTTP/enhanced 200 Ok" harus dibuang
-		if !strings.HasPrefix(strings.ToUpper(trimmed), "HTTP/") {
-			pending = append(pending, trailing...)
+	if trailingNorm != "" {
+		trimmedUpper := strings.ToUpper(strings.TrimSpace(trailingNorm))
+		if strings.HasPrefix(trimmedUpper, "HTTP/") {
+			// cari akhir fake response (baris kosong)
+			if idx := strings.Index(trailingNorm, "\r\n\r\n"); idx != -1 {
+				rest := trailingNorm[idx+4:]
+				if rest != "" {
+					pending = append(pending, []byte(rest)...)
+				}
+			}
+			// else: seluruh trailing adalah fake response → discard
+		} else {
+			pending = append(pending, []byte(trailingNorm)...)
 		}
 	}
 
