@@ -11,7 +11,7 @@ WORKDIR /src
 RUN curl -fsSL https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.130.tar.gz | tar -xz \
  && cd badvpn-1.999.130 && mkdir build && cd build \
  && cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 \
- && make badvpn-udpgw
+ && make -j"$(nproc)" badvpn-udpgw
 
 # =================================================================
 # STAGE 2: Frontend React (build → obfuscate → inline)
@@ -19,17 +19,17 @@ RUN curl -fsSL https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.130.ta
 FROM node:20-slim AS frontend
 WORKDIR /web
 
-# ── 2a) Install SEMUA deps (dev + prod) ──
+# ── 2a) Install SEMUA deps (dev + prod) dengan cache mount ──
 COPY package.json package-lock.json* ./
-RUN if [ -f package-lock.json ]; then \
+RUN --mount=type=cache,target=/root/.npm \
+    if [ -f package-lock.json ]; then \
         npm ci --include=dev --no-audit --no-fund; \
     else \
         npm install --include=dev --no-audit --no-fund; \
     fi
 
 # ── 2b) Copy semua sumber ──
-#      ⚠️  Pastikan .dockerignore TIDAK mengecualikan:
-#          scripts/, src/, public/, dist/, index.html
+#      ⚠️  Pastikan .dockerignore TIDAK mengecualikan scripts/, src/, public/
 COPY . .
 
 # ── 2c) Build Vite + verifikasi output ──
@@ -57,7 +57,6 @@ RUN npx --yes javascript-obfuscator@4 ./dist/assets \
  && echo "=== assets setelah obfuscate ===" && ls -la dist/assets/
 
 # ── 2e) Inline CSS+JS+favicon → frontend.html.cjs ──
-#      ⚠️  PENTING: panggil .mjs (bukan .js)
 RUN node --trace-warnings scripts/inline-html.mjs \
  && echo "=== frontend.html.cjs ===" \
  && ls -la frontend.html.cjs \
@@ -66,18 +65,28 @@ RUN node --trace-warnings scripts/inline-html.mjs \
 # =================================================================
 # STAGE 3: Go Binary (wsproxy)
 # =================================================================
-FROM golang:1.22-bookworm AS go-builder
+FROM --platform=$BUILDPLATFORM golang:1.22-bookworm AS go-builder
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /build
 COPY go.mod go.sum* ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
 COPY cmd/ ./cmd/
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/worker ./cmd/wsproxy
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -ldflags="-s -w" -o /out/worker ./cmd/wsproxy
 
 # =================================================================
 # STAGE 4: Obfuscate server.cjs
 # =================================================================
 FROM node:20-slim AS obfuscator
 WORKDIR /opt
-RUN npm init -y >/dev/null && npm install javascript-obfuscator@4 --no-audit --no-fund
+RUN --mount=type=cache,target=/root/.npm \
+    npm init -y >/dev/null && \
+    npm install javascript-obfuscator@4 --no-audit --no-fund
 COPY server.cjs ./server.cjs
 RUN npx javascript-obfuscator ./server.cjs \
     --output ./server.cjs \
@@ -126,9 +135,15 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get install -y nodejs \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ── Cloudflared ──
-RUN curl -fsSL -o /usr/local/bin/cloudflared \
-    https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+# ── Cloudflared (multi-arch) ──
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+        amd64) CF_ARCH=amd64 ;; \
+        arm64) CF_ARCH=arm64 ;; \
+        *) echo "Unsupported arch: ${TARGETARCH}" && exit 1 ;; \
+    esac && \
+    curl -fsSL -o /usr/local/bin/cloudflared \
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" \
  && chmod +x /usr/local/bin/cloudflared
 
 # =================================================================
@@ -156,18 +171,16 @@ RUN mkdir -p /etc/dropbear && \
 # Node deps panel
 # =================================================================
 COPY package.json package-lock.json* ./
-RUN if [ -f package-lock.json ]; then \
+RUN --mount=type=cache,target=/root/.npm \
+    if [ -f package-lock.json ]; then \
         npm ci --omit=dev --no-audit --no-fund; \
     else \
         npm install --omit=dev --no-audit --no-fund; \
     fi
 
-# ── App code (server.cjs hasil obfuscate) ──
+# ── App code ──
 COPY --from=obfuscator /opt/server.cjs ./server.cjs
-
-# ⭐ FRONTEND EMBEDDED — pengganti COPY dist/
 COPY --from=frontend /web/frontend.html.cjs ./frontend.html.cjs
-
 COPY start.sh ./
 
 # ── Nginx config ──
@@ -182,7 +195,7 @@ RUN mkdir -p /var/run /var/log/nginx /var/run/dropbear /etc/nginx/ssl \
         -out    /etc/nginx/ssl/server.crt \
  && chmod 600 /etc/nginx/ssl/server.key
 
-# ── Validasi nginx saat build ──
+# ── Validasi nginx ──
 RUN nginx -t -c /etc/nginx/nginx.conf 2>&1 || \
     (echo "❌ nginx.conf tidak valid!" && exit 1)
 
