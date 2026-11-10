@@ -1,16 +1,20 @@
 # ============================================
-# .dockerignore — JANGAN HAPUS BARIS node_modules
+# .dockerignore
 # ============================================
 
-# ⛔ KRITIS: tanpa ini, node_modules host menimpa Linux node_modules di stage frontend
+# ⛔ KRITIS: tanpa baris ini, node_modules host menimpa Linux di stage frontend
 node_modules/
 **/node_modules/
 
-# Build artifacts (Vite / Go)
-dist/
-build/
-out/
-frontend.html.cjs
+# Build artifacts lokal (biar tidak bikin image bloated)
+# ⚠️  PENTING: `dist/` JANGAN di-exclude — dibutuhkan stage frontend
+#     kalau mau cache-safe, boleh exclude tapi pastikan `npm run build` di Docker
+#     menghasilkan dist/ baru. Di Dockerfile di atas, dist/ lama di-copy
+#     lalu ditimpa `npm run build`. Kalau exclude dist/, juga tidak masalah.
+# dist/
+# build/
+# out/
+# frontend.html.cjs
 *.exe
 *.test
 
@@ -24,10 +28,12 @@ frontend.html.cjs
 .vscode/
 .idea/
 *.swp
+*.swo
 
 # Docs & env
 README*.md
 LICENSE
+CHANGELOG*.md
 .env
 .env.*
 !.env.example
@@ -36,7 +42,7 @@ LICENSE
 .DS_Store
 Thumbs.db
 
-# Docker files sendiri (tidak perlu di-copy ke image)
+# Docker files sendiri
 Dockerfile*
 docker-compose*.yml
 .dockerignore
@@ -44,3 +50,4 @@ docker-compose*.yml
 # Log
 *.log
 npm-debug.log*
+yarn-error.log*
