@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "build:embed": "vite build && node scripts/inline-html.js",
+    "build:obfuscate": "npm run build && npx --yes javascript-obfuscator@4 ./dist/assets --output ./dist/assets --compact true --string-array true --string-array-encoding base64 --string-array-rotate true --string-array-shuffle true --string-array-threshold 0.75 --split-strings true --split-strings-chunk-length 6 --self-defending false --identifier-names-generator hexadecimal && node scripts/inline-html.js",
     "lint": "eslint .",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.app.json"
