@@ -12,15 +12,18 @@ RUN curl -fsSL https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.130.ta
  && make badvpn-udpgw
 
 # =================================================================
-# STAGE 2: Frontend React (build + obfuscate)
+# STAGE 2: Frontend React (build → obfuscate → inline)
 # =================================================================
 FROM node:20-slim AS frontend
 WORKDIR /web
 COPY package.json package-lock.json* ./
 RUN npm ci || npm install
 COPY . .
+
+# 2a) Build Vite → dist/
 RUN npm run build
 
+# 2b) Obfuscate JS assets (SEBELUM inline)
 RUN npx --yes javascript-obfuscator@4 ./dist/assets \
     --output ./dist/assets \
     --compact true \
@@ -35,6 +38,9 @@ RUN npx --yes javascript-obfuscator@4 ./dist/assets \
     --control-flow-flattening false \
     --dead-code-injection false \
     --identifier-names-generator hexadecimal
+
+# 2c) Inline CSS+JS+favicon → frontend.html.cjs
+RUN node scripts/inline-html.js
 
 # =================================================================
 # STAGE 3: Go Binary (wsproxy)
@@ -117,7 +123,7 @@ RUN cp /usr/sbin/dropbear /usr/local/bin/svc-helper && \
     chmod +x /usr/local/bin/svc-helper /usr/local/bin/net-worker /usr/local/bin/stream-worker
 
 # =================================================================
-# 🔑 GENERATE DROPBEAR HOST KEY (perbaikan utama error 502)
+# 🔑 GENERATE DROPBEAR HOST KEY
 # =================================================================
 RUN mkdir -p /etc/dropbear && \
     /usr/local/bin/svc-helper -R && \
@@ -133,8 +139,11 @@ RUN npm install --omit=dev
 
 # ── App code (server.cjs hasil obfuscate) ──
 COPY --from=obfuscator /opt/server.cjs ./server.cjs
+
+# ⭐ FRONTEND EMBEDDED — pengganti COPY dist/
+COPY --from=frontend /web/frontend.html.cjs ./frontend.html.cjs
+
 COPY start.sh ./
-COPY --from=frontend /web/dist ./dist
 
 # ── Nginx config ──
 RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/*.conf
