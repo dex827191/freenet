@@ -1,8 +1,4 @@
 // scripts/inline-html.mjs
-// Force ES module (.mjs) → aman apapun isi "type" di package.json
-// Input : dist/index.html + dist/assets/*
-// Output: frontend.html.cjs (CommonJS module berisi string HTML)
-
 import fs from "node:fs";
 import path from "node:path";
 
@@ -10,7 +6,6 @@ const CWD  = process.cwd();
 const DIST = path.join(CWD, "dist");
 const OUT  = path.join(CWD, "frontend.html.cjs");
 
-// ==================== Helpers ====================
 const log  = (...a) => console.log("[inline]", ...a);
 const warn = (...a) => console.warn("[inline] ⚠️ ", ...a);
 
@@ -30,14 +25,12 @@ function fail(msg) {
   process.exit(1);
 }
 
-// ==================== 1) DEBUG ====================
 log("CWD:", CWD);
 log("ls CWD:", tryLs(CWD));
 log("ls dist:", tryLs(DIST));
 log("ls dist/assets:", tryLs(path.join(DIST, "assets")));
 log("Node:", process.version);
 
-// ==================== 2) Verifikasi dist/index.html ====================
 const indexHtmlPath = path.join(DIST, "index.html");
 if (!fs.existsSync(indexHtmlPath)) {
   fail("dist/index.html tidak ada — `npm run build` gagal? cek output vite build");
@@ -46,7 +39,6 @@ let html = fs.readFileSync(indexHtmlPath, "utf8");
 log("index.html:", html.length, "bytes");
 log("index.html preview:", JSON.stringify(html.slice(0, 300)));
 
-// ==================== 3) Resolve asset path ====================
 function resolveAsset(relHref) {
   const clean = relHref
     .split("?")[0]
@@ -67,7 +59,6 @@ function resolveAsset(relHref) {
   return null;
 }
 
-// ==================== 4) Inline CSS ====================
 html = html.replace(
   /<link\b[^>]*\brel=["']stylesheet["'][^>]*>/gi,
   (tag) => {
@@ -81,7 +72,6 @@ html = html.replace(
   }
 );
 
-// ==================== 5) Inline JS ====================
 html = html.replace(
   /<script\b([^>]*?)\bsrc=["']([^"']+)["']([^>]*)><\/script>/gi,
   (tag, pre, src, post) => {
@@ -95,7 +85,6 @@ html = html.replace(
   }
 );
 
-// ==================== 6) Inline favicon ====================
 html = html.replace(
   /<link\b[^>]*\brel=["'](?:shortcut icon|icon)["'][^>]*>/gi,
   (tag) => {
@@ -106,23 +95,16 @@ html = html.replace(
     const buf = fs.readFileSync(p);
     const ext = path.extname(p).toLowerCase();
     const mime = {
-      ".ico":   "image/x-icon",
-      ".png":   "image/png",
-      ".svg":   "image/svg+xml",
-      ".jpg":   "image/jpeg",
-      ".jpeg":  "image/jpeg",
-      ".webp":  "image/webp",
-      ".gif":   "image/gif",
+      ".ico":"image/x-icon", ".png":"image/png", ".svg":"image/svg+xml",
+      ".jpg":"image/jpeg", ".jpeg":"image/jpeg", ".webp":"image/webp", ".gif":"image/gif",
     }[ext] || "application/octet-stream";
     log("ICON inline:", path.basename(p), buf.length, "bytes");
     return `<link rel="icon" href="data:${mime};base64,${buf.toString("base64")}">`;
   }
 );
 
-// ==================== 7) Hapus modulepreload ====================
 html = html.replace(/<link\b[^>]*\brel=["']modulepreload["'][^>]*>/gi, "");
 
-// ==================== 8) Tulis output .cjs ====================
 const escaped = JSON.stringify(html)
   .replace(/\u2028/g, "\\u2028")
   .replace(/\u2029/g, "\\u2029");
