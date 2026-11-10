@@ -23,6 +23,7 @@ const (
 	DefaultWSListenPort = "8880"
 	HeaderReadLimit     = 32 * 1024
 	HeaderReadTimeout   = 10 * time.Second
+	ProbeTimeout        = 500 * time.Millisecond
 )
 
 type ProxyConfig struct {
@@ -79,26 +80,85 @@ func parseHeaders(raw string) map[string]string {
 	return headers
 }
 
-// readHttpHeaders baca sampai \r\n\r\n, return headers + sisa byte setelahnya
+// readHttpHeaders mendukung 3 format:
+//  1. HTTP standar (akhir header: \r\n\r\n)
+//  2. WebSocket sederhana dengan [crlf] (akhir: [crlf][crlf])
+//  3. Pylod Enhanced (decoy + WS + [split] + fake response)
 func readHttpHeaders(conn net.Conn) (string, []byte, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(HeaderReadTimeout))
 	defer conn.SetReadDeadline(time.Time{})
 
 	var buf []byte
 	tmp := make([]byte, 4096)
+	wsMarkerEnd := -1
+	probed := false
+
 	for {
 		n, err := conn.Read(tmp)
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
-			if idx := bytes.Index(buf, []byte("\r\n\r\n")); idx != -1 {
-				headerEnd := idx + 4
-				return string(buf[:headerEnd]), buf[headerEnd:], nil
+			probed = false
+
+			// PRIORITAS 1: [split] = penanda akhir payload Pylod Enhanced
+			if idx := bytes.Index(buf, []byte("[split]")); idx != -1 {
+				return string(buf[:idx]), buf[idx+len("[split]"):], nil
 			}
+
+			// Deteksi marker WS upgrade
+			if wsMarkerEnd == -1 {
+				bufLower := bytes.ToLower(buf)
+				if idx := bytes.Index(bufLower, []byte("upgrade:websocket")); idx != -1 {
+					wsMarkerEnd = idx + len("upgrade:websocket")
+				} else if idx := bytes.Index(bufLower, []byte("upgrade: websocket")); idx != -1 {
+					wsMarkerEnd = idx + len("upgrade: websocket")
+				}
+			}
+
+			if wsMarkerEnd != -1 {
+				// PRIORITAS 2: header end SETELAH marker WS (hindari decoy)
+				if subIdx := bytes.Index(buf[wsMarkerEnd:], []byte("[crlf][crlf]")); subIdx != -1 {
+					end := wsMarkerEnd + subIdx + len("[crlf][crlf]")
+					return string(buf[:end]), buf[end:], nil
+				}
+				if subIdx := bytes.Index(buf[wsMarkerEnd:], []byte("\r\n\r\n")); subIdx != -1 {
+					end := wsMarkerEnd + subIdx + 4
+					return string(buf[:end]), buf[end:], nil
+				}
+			} else {
+				// PRIORITAS 3: tanpa WS marker
+				hasCrlf := bytes.Contains(buf, []byte("[crlf]"))
+				if !hasCrlf {
+					if idx := bytes.Index(buf, []byte("\r\n\r\n")); idx != -1 {
+						return string(buf[:idx+4]), buf[idx+4:], nil
+					}
+				} else if !probed {
+					// Ada [crlf] tapi belum ada WS marker → probe data tambahan
+					if lastIdx := bytes.LastIndex(buf, []byte("[crlf][crlf]")); lastIdx != -1 {
+						probed = true
+						_ = conn.SetReadDeadline(time.Now().Add(ProbeTimeout))
+						n2, err2 := conn.Read(tmp)
+						_ = conn.SetReadDeadline(time.Now().Add(HeaderReadTimeout))
+						if n2 > 0 {
+							buf = append(buf, tmp[:n2]...)
+							probed = false
+							continue
+						}
+						if err2 != nil {
+							end := lastIdx + len("[crlf][crlf]")
+							return string(buf[:end]), buf[end:], nil
+						}
+					}
+				}
+			}
+
 			if len(buf) > HeaderReadLimit {
 				return "", nil, fmt.Errorf("header too large")
 			}
 		}
 		if err != nil {
+			if len(buf) > 0 {
+				return string(buf), nil, nil
+			}
 			return "", nil, err
 		}
 	}
@@ -110,6 +170,38 @@ func genWsKey() string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
+// normalizeRequest: [crlf] -> \r\n, buang baris status kustom "HTTP/enhanced"
+func normalizeRequest(raw string) string {
+	normalized := strings.ReplaceAll(raw, "[crlf]", "\r\n")
+	lines := strings.Split(normalized, "\r\n")
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(trimmed), "http/enhanced") {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.Join(filtered, "\r\n")
+}
+
+// findWsRequest: dari stream yang berisi multiple HTTP request (decoy + WS),
+// ambil blok yang mengandung "Upgrade: websocket"
+func findWsRequest(raw string) string {
+	rawLower := strings.ToLower(raw)
+	if !strings.Contains(rawLower, "upgrade:websocket") && !strings.Contains(rawLower, "upgrade: websocket") {
+		return raw
+	}
+	blocks := strings.Split(raw, "\r\n\r\n")
+	for i := len(blocks) - 1; i >= 0; i-- {
+		blockLower := strings.ToLower(blocks[i])
+		if strings.Contains(blockLower, "upgrade:websocket") || strings.Contains(blockLower, "upgrade: websocket") {
+			return blocks[i]
+		}
+	}
+	return raw
+}
+
 func handleWS(client net.Conn, cfg ProxyConfig) {
 	defer client.Close()
 	tweakSocket(client, cfg.KeepAlive)
@@ -119,9 +211,14 @@ func handleWS(client net.Conn, cfg ProxyConfig) {
 		return
 	}
 
-	headers := parseHeaders(rawHeaders)
-	rawLower := strings.ToLower(rawHeaders)
-	isWsUpgrade := strings.Contains(rawLower, "upgrade: websocket")
+	// === SUPPORT PYLOD ENHANCED ===
+	actualRequest := normalizeRequest(rawHeaders)
+	actualRequest = findWsRequest(actualRequest)
+
+	headers := parseHeaders(actualRequest)
+	rawLower := strings.ToLower(actualRequest)
+	isWsUpgrade := strings.Contains(rawLower, "upgrade:websocket") ||
+		strings.Contains(rawLower, "upgrade: websocket")
 
 	if isWsUpgrade {
 		wsKey := headers["sec-websocket-key"]
@@ -162,15 +259,20 @@ func handleWS(client net.Conn, cfg ProxyConfig) {
 	defer sshConn.Close()
 	tweakSocket(sshConn, cfg.KeepAlive)
 
-	// Preserve trailing bytes yang sudah terlanjur diterima saat baca header
+	// Preserve trailing bytes; buang fake HTTP response dari Pylod Enhanced
 	pending := make([]byte, 0, cfg.MaxBuffer)
 	if len(trailing) > 0 {
-		pending = append(pending, trailing...)
+		trailingNorm := strings.ReplaceAll(string(trailing), "[crlf]", "\r\n")
+		trimmed := strings.TrimSpace(trailingNorm)
+		// Fake response seperti "HTTP/enhanced 200 Ok" harus dibuang
+		if !strings.HasPrefix(strings.ToUpper(trimmed), "HTTP/") {
+			pending = append(pending, trailing...)
+		}
 	}
 
 	done := make(chan struct{}, 2)
 
-	// Client -> SSH (dengan filter "SSH-", tahan split antar paket)
+	// Client -> SSH (filter "SSH-", tahan split antar paket)
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 64*1024)
