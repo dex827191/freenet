@@ -35,7 +35,22 @@ const ADMIN_PASS_FILE = "/tmp/admin_pass.txt";
 const STATS_PATH = "/tmp/server_stats.json";
 const DB_PATH = "/tmp/ssh_details.json";
 
-// Path ke hasil build frontend React (Vite)
+// ========================================================
+// EMBEDDED FRONTEND (single-file build)
+// ========================================================
+// frontend.html.cjs adalah hasil build Vite yang sudah:
+//   - obfuscated (assets/*.js)
+//   - di-inline (CSS + JS + favicon → satu HTML string)
+// Dibuat oleh scripts/inline-html.js saat `npm run build:embed`.
+let INDEX_HTML = null;
+try {
+    INDEX_HTML = require('./frontend.html.cjs');
+    console.log(`[UI] ✅ Embedded HTML loaded (${(INDEX_HTML.length / 1024).toFixed(1)} KB)`);
+} catch (e) {
+    console.log('[UI] ⚠️  frontend.html.cjs tidak ditemukan — fallback ke dist/ (mode dev)');
+}
+
+// Fallback path (hanya untuk `npm run dev` lokal, TIDAK ada di runtime image)
 const DIST_DIR = path.join(__dirname, 'dist');
 
 let cachedDiskUsage = "38%";
@@ -51,9 +66,6 @@ if (!fs.existsSync(FILE_PATH)) {
 // ========================================================
 const UUID_FILE = path.join(FILE_PATH, 'uuid.txt');
 
-/**
- * Generate UUID v4 format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
- */
 function generateUUID() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
         const r = (Math.random() * 16) | 0;
@@ -62,28 +74,20 @@ function generateUUID() {
     });
 }
 
-/**
- * Ambil UUID dari file persistent. Jika belum ada → generate baru & simpan.
- * ENV `UUID` masih di-support (opsional) untuk backward compatibility.
- */
 function getOrCreateUUID() {
-    // Override via ENV (opsional — untuk deployment yang butuh UUID tetap)
     if (process.env.UUID && process.env.UUID.trim()) {
         console.log(`[UUID] Menggunakan UUID dari ENV: ${process.env.UUID.trim()}`);
         return process.env.UUID.trim();
     }
-    // Load dari file persistent
     try {
         if (fs.existsSync(UUID_FILE)) {
             const saved = fs.readFileSync(UUID_FILE, 'utf8').trim();
-            // Validasi format UUID v4
             if (/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(saved)) {
                 console.log(`[UUID] Loaded dari file: ${saved}`);
                 return saved;
             }
         }
     } catch (e) {}
-    // Generate baru & simpan
     const newUuid = generateUUID();
     try {
         fs.writeFileSync(UUID_FILE, newUuid);
@@ -238,18 +242,16 @@ function getDomainsByPort(targetPorts) {
             let match;
             while ((match = regexIngress.exec(logContent)) !== null) {
                 const domainName = match[1].trim();
-                const portNum = match[2];
                 if (!domains.some(d => d.domain === domainName)) {
-                    domains.push({ domain: domainName, port: portNum });
+                    domains.push({ domain: domainName, port: match[2] });
                 }
             }
             if (domains.length === 0) {
                 const regexIngressReverse = new RegExp(`localhost:(${portRegexStr})[^}]*?(?:\\\\"|")hostname(?:\\\\"|")\\s*:\\s*(?:\\\\"|")([^"\\\\]+)(?:\\\\"|")`, 'g');
                 while ((match = regexIngressReverse.exec(logContent)) !== null) {
-                    const portNum = match[1];
                     const domainName = match[2].trim();
                     if (!domains.some(d => d.domain === domainName)) {
-                        domains.push({ domain: domainName, port: portNum });
+                        domains.push({ domain: domainName, port: match[1] });
                     }
                 }
             }
@@ -289,8 +291,7 @@ function listSsh() {
         const dbInfo = loadDb();
         if (!fs.existsSync('/etc/passwd')) return { status: "success", total: 0, users: [] };
         const passwdContent = fs.readFileSync('/etc/passwd', 'utf8');
-        const lines = passwdContent.split('\n');
-        for (let line of lines) {
+        for (let line of passwdContent.split('\n')) {
             if (!line.trim()) continue;
             const parts = line.split(':');
             const username = parts[0];
@@ -542,7 +543,7 @@ async function generateLinks(argoDomain) {
 }
 
 // ========================================================
-// MIME TYPES FOR STATIC FILES
+// STATIC FILE HANDLER (fallback dev only)
 // ========================================================
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -576,6 +577,21 @@ function serveStaticFile(reqPath, res) {
   const contentType = MIME_TYPES[ext] || 'application/octet-stream';
   res.writeHead(200, { 'Content-Type': contentType });
   fs.createReadStream(filePath).pipe(res);
+}
+
+// ========================================================
+// SPA HTML SENDER (embedded-first, dist/ fallback)
+// ========================================================
+function sendIndexHtml(res) {
+  if (INDEX_HTML) {
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-cache',
+    });
+    return res.end(INDEX_HTML);
+  }
+  // Fallback (dev lokal): baca dari dist/index.html
+  return serveStaticFile('index.html', res);
 }
 
 // ========================================================
@@ -619,9 +635,8 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
         if (fs.existsSync(ZT_LOG_PATH)) {
             return res.end(fs.readFileSync(ZT_LOG_PATH, 'utf8'));
-        } else {
-            return res.end("Log Zero Trust belum terbuat atau file tidak ditemukan.");
         }
+        return res.end("Log Zero Trust belum terbuat atau file tidak ditemukan.");
     }
 
     if (pathName === '/api/setup-pass') {
@@ -754,11 +769,12 @@ const server = http.createServer(async (req, res) => {
 
     if (pathName === '/api/login') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        const isPassConfigured = getAdminPassword() !== null;
-        if (!isPassConfigured) {
+        if (getAdminPassword() === null) {
             return res.end(JSON.stringify({ status: "not_configured", message: "Password Admin belum dibuat!" }));
         }
-        return res.end(JSON.stringify(verifyAdminPassword(query.pass) ? { status: "success", token: query.pass } : { status: "error", message: "Password Salah!" }));
+        return res.end(JSON.stringify(verifyAdminPassword(query.pass)
+            ? { status: "success", token: query.pass }
+            : { status: "error", message: "Password Salah!" }));
     }
 
     if (pathName === '/api/stats') {
@@ -773,18 +789,18 @@ const server = http.createServer(async (req, res) => {
             user_list_details: cachedUserListDetails
         };
         if (fs.existsSync(STATS_PATH)) { try { hwInfo = { ...hwInfo, ...JSON.parse(fs.readFileSync(STATS_PATH, 'utf8')) }; } catch (e) {} }
-        let quickUrl = currentActiveDomain || "Menunggu Quick Tunnel...";
-        let ztSshDomains = getDomainsByPort(['8880', '8881']);
-        let ztVmessDomains = getDomainsByPort(['8001']);
-        let passConfigured = getAdminPassword() !== null;
-        let netSettings = getNetworkSettings();
-        let wsProxyCfg = getWsProxyConfig();
-        let sysSettings = getSystemSettings();
-        let rlwyPublicDomain = process.env.RAILWAY_PUBLIC_DOMAIN || "";
-        let rlwyTcpDomain = (process.env.RAILWAY_TCP_PROXY_DOMAIN && process.env.RAILWAY_TCP_PROXY_PORT)
+        const quickUrl = currentActiveDomain || "Menunggu Quick Tunnel...";
+        const ztSshDomains = getDomainsByPort(['8880', '8881']);
+        const ztVmessDomains = getDomainsByPort(['8001']);
+        const passConfigured = getAdminPassword() !== null;
+        const netSettings = getNetworkSettings();
+        const wsProxyCfg = getWsProxyConfig();
+        const sysSettings = getSystemSettings();
+        const rlwyPublicDomain = process.env.RAILWAY_PUBLIC_DOMAIN || "";
+        const rlwyTcpDomain = (process.env.RAILWAY_TCP_PROXY_DOMAIN && process.env.RAILWAY_TCP_PROXY_PORT)
             ? `${process.env.RAILWAY_TCP_PROXY_DOMAIN}:${process.env.RAILWAY_TCP_PROXY_PORT}`
             : (process.env.SNI ? process.env.SNI.replace(/https?:\/\//, '') : (hwInfo.railway_proxy || "Tidak Aktif"));
-        let cleanOnlineStr = String(hwInfo.ssh_online).replace(/👥/g, '').replace(/Active/g, '').replace(/Users/g, '').trim();
+        const cleanOnlineStr = String(hwInfo.ssh_online).replace(/👥/g, '').replace(/Active/g, '').replace(/Users/g, '').trim();
         return res.end(JSON.stringify({
             active_cfip: getActiveCfip(),
             quick_url: quickUrl,
@@ -804,14 +820,14 @@ const server = http.createServer(async (req, res) => {
         }));
     }
 
-    // --- SERVE REACT FRONTEND (SPA) ---
+    // --- SERVE EMBEDDED FRONTEND (SPA) ---
     if (pathName === '/' || pathName === '/index.html') {
-        return serveStaticFile('index.html', res);
+        return sendIndexHtml(res);
     }
 
-    // Any other non-API path -> serve static file from dist/
+    // SPA fallback: semua route non-API → HTML embedded
     if (!pathName.startsWith('/api/') && !pathName.startsWith('/__')) {
-        return serveStaticFile(pathName, res);
+        return sendIndexHtml(res);
     }
 
     res.writeHead(404, { 'Content-Type': 'text/plain' });
@@ -854,6 +870,8 @@ server.on('upgrade', (req, socket, head) => {
 server.listen(PORT, () => {
     console.log(`[UI & Xray Gateway Engine] Running on port ${PORT}`);
     console.log(`[UUID] Active UUID: ${UUID}`);
+    console.log(`[UI] Mode: ${INDEX_HTML ? 'EMBEDDED' : 'dist/ fallback'}`);
+
     generateConfig()
       .then(() => downloadFilesAndRun())
       .then(() => extractDomains())
