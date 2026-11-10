@@ -1,116 +1,132 @@
-#!/usr/bin/env node
-/**
- * inline-html.js — Vite-aware, defensive
- * Input : dist/index.html + dist/assets/*
- * Output: frontend.html.cjs (CommonJS module berisi string HTML)
- */
-"use strict";
+// scripts/inline-html.mjs
+// Force ES module (.mjs) → aman apapun isi "type" di package.json
+// Input : dist/index.html + dist/assets/*
+// Output: frontend.html.cjs (CommonJS module berisi string HTML)
 
-const fs   = require("fs");
-const path = require("path");
+import fs from "node:fs";
+import path from "node:path";
 
 const CWD  = process.cwd();
 const DIST = path.join(CWD, "dist");
 const OUT  = path.join(CWD, "frontend.html.cjs");
 
-// ---------- helpers ----------
+// ==================== Helpers ====================
+const log  = (...a) => console.log("[inline]", ...a);
+const warn = (...a) => console.warn("[inline] ⚠️ ", ...a);
+
+function tryLs(p) {
+  try { return fs.readdirSync(p); } catch (e) { return `(tidak bisa: ${e.code})`; }
+}
+
 function fail(msg) {
-  console.error("\n[inline] ❌ FATAL:", msg);
-  console.error("[inline] CWD   :", CWD);
-  console.error("[inline] ls CWD:", safeLs(CWD));
-  if (fs.existsSync(DIST)) console.error("[inline] ls dist:", safeLs(DIST));
+  console.error("\n========== INLINE FAILED ==========");
+  console.error("[inline] FATAL:", msg);
+  console.error("[inline] CWD:", CWD);
+  console.error("[inline] ls CWD:", tryLs(CWD));
+  console.error("[inline] ls dist:", tryLs(DIST));
+  console.error("[inline] ls dist/assets:", tryLs(path.join(DIST, "assets")));
+  console.error("[inline] Node:", process.version);
+  console.error("====================================");
   process.exit(1);
 }
-function safeLs(p) {
-  try { return fs.readdirSync(p); } catch { return "(tidak bisa dibaca)"; }
+
+// ==================== 1) DEBUG ====================
+log("CWD:", CWD);
+log("ls CWD:", tryLs(CWD));
+log("ls dist:", tryLs(DIST));
+log("ls dist/assets:", tryLs(path.join(DIST, "assets")));
+log("Node:", process.version);
+
+// ==================== 2) Verifikasi dist/index.html ====================
+const indexHtmlPath = path.join(DIST, "index.html");
+if (!fs.existsSync(indexHtmlPath)) {
+  fail("dist/index.html tidak ada — `npm run build` gagal? cek output vite build");
 }
-function readAsset(relHref) {
-  // relHref contoh: "/assets/index-abc123.js", "vite.svg", "/favicon.ico"
-  const clean = relHref.split("?")[0].split("#")[0].replace(/^\/+/, "");
+let html = fs.readFileSync(indexHtmlPath, "utf8");
+log("index.html:", html.length, "bytes");
+log("index.html preview:", JSON.stringify(html.slice(0, 300)));
+
+// ==================== 3) Resolve asset path ====================
+function resolveAsset(relHref) {
+  const clean = relHref
+    .split("?")[0]
+    .split("#")[0]
+    .replace(/^\.?\//, "")
+    .replace(/^\/+/, "");
   const candidates = [
     path.join(DIST, clean),
     path.join(DIST, "assets", path.basename(clean)),
     path.join(DIST, path.basename(clean)),
+    path.join(CWD, clean),
+    path.join(CWD, "public", clean),
+    path.join(CWD, "src", clean),
   ];
-  for (const c of candidates) if (fs.existsSync(c)) return c;
-  console.warn("[inline] ⚠️  asset tidak ditemukan:", relHref);
+  for (const c of candidates) {
+    if (fs.existsSync(c) && fs.statSync(c).isFile()) return c;
+  }
   return null;
 }
-function extToMime(ext) {
-  return {
-    ".ico":  "image/x-icon",
-    ".png":  "image/png",
-    ".svg":  "image/svg+xml",
-    ".jpg":  "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".gif":  "image/gif",
-    ".woff": "font/woff",
-    ".woff2":"font/woff2",
-    ".ttf":  "font/ttf",
-  }[ext.toLowerCase()] || "application/octet-stream";
-}
 
-// ---------- 1) verifikasi input ----------
-if (!fs.existsSync(DIST))              fail("Folder dist/ tidak ada — `npm run build` gagal?");
-if (!fs.existsSync(path.join(DIST,"index.html"))) fail("dist/index.html tidak ada");
-
-let html = fs.readFileSync(path.join(DIST, "index.html"), "utf8");
-console.log("[inline] Sumber:", path.join(DIST, "index.html"), `(${html.length} bytes)`);
-
-// ---------- 2) inline stylesheet ----------
+// ==================== 4) Inline CSS ====================
 html = html.replace(
   /<link\b[^>]*\brel=["']stylesheet["'][^>]*>/gi,
   (tag) => {
     const m = tag.match(/\bhref=["']([^"']+)["']/i);
     if (!m) return tag;
-    const p = readAsset(m[1]);
-    if (!p) return tag;
+    const p = resolveAsset(m[1]);
+    if (!p) { warn("CSS tidak ditemukan:", m[1]); return tag; }
     const css = fs.readFileSync(p, "utf8");
-    console.log("[inline] CSS   :", path.basename(p), `(${css.length} bytes)`);
+    log("CSS inline:", path.basename(p), css.length, "bytes");
     return `<style>\n${css}\n</style>`;
   }
 );
 
-// ---------- 3) inline <script src="..."> (pertahankan type="module") ----------
+// ==================== 5) Inline JS ====================
 html = html.replace(
   /<script\b([^>]*?)\bsrc=["']([^"']+)["']([^>]*)><\/script>/gi,
   (tag, pre, src, post) => {
-    const p = readAsset(src);
-    if (!p) return tag;
+    const p = resolveAsset(src);
+    if (!p) { warn("JS tidak ditemukan:", src); return tag; }
     let js = fs.readFileSync(p, "utf8");
-    js = js.replace(/<\/script>/gi, "<\\/script>");   // cegah premature close
-    console.log("[inline] JS    :", path.basename(p), `(${js.length} bytes)`);
-    // buang atribut src tapi pertahankan type="module" / crossorigin
-    return `<script${pre}${post}>\n${js}\n</script>`;
+    js = js.replace(/<\/script>/gi, "<\\/script>");
+    log("JS inline:", path.basename(p), js.length, "bytes");
+    const cleanPre = pre.replace(/\bsrc=["'][^"']*["']\s*/gi, "");
+    return `<script${cleanPre}${post}>\n${js}\n</script>`;
   }
 );
 
-// ---------- 4) hapus modulepreload (redundan setelah inline) ----------
-html = html.replace(/<link\b[^>]*\brel=["']modulepreload["'][^>]*>/gi, "");
-
-// ---------- 5) inline favicon ----------
+// ==================== 6) Inline favicon ====================
 html = html.replace(
   /<link\b[^>]*\brel=["'](?:shortcut icon|icon)["'][^>]*>/gi,
   (tag) => {
     const m = tag.match(/\bhref=["']([^"']+)["']/i);
     if (!m) return tag;
-    const p = readAsset(m[1]);
-    if (!p) return tag;
+    const p = resolveAsset(m[1]);
+    if (!p) { warn("favicon tidak ditemukan:", m[1]); return tag; }
     const buf = fs.readFileSync(p);
-    const mime = extToMime(path.extname(p));
-    const uri = `data:${mime};base64,${buf.toString("base64")}`;
-    console.log("[inline] ICON  :", path.basename(p), `(${buf.length} bytes)`);
-    return `<link rel="icon" href="${uri}">`;
+    const ext = path.extname(p).toLowerCase();
+    const mime = {
+      ".ico":   "image/x-icon",
+      ".png":   "image/png",
+      ".svg":   "image/svg+xml",
+      ".jpg":   "image/jpeg",
+      ".jpeg":  "image/jpeg",
+      ".webp":  "image/webp",
+      ".gif":   "image/gif",
+    }[ext] || "application/octet-stream";
+    log("ICON inline:", path.basename(p), buf.length, "bytes");
+    return `<link rel="icon" href="data:${mime};base64,${buf.toString("base64")}">`;
   }
 );
 
-// ---------- 6) tulis output sebagai CJS ----------
-// Escape U+2028 / U+2029 agar tidak pecah saat di-parse JS
+// ==================== 7) Hapus modulepreload ====================
+html = html.replace(/<link\b[^>]*\brel=["']modulepreload["'][^>]*>/gi, "");
+
+// ==================== 8) Tulis output .cjs ====================
 const escaped = JSON.stringify(html)
   .replace(/\u2028/g, "\\u2028")
   .replace(/\u2029/g, "\\u2029");
 
-const out = `// AUTO-GENERATED by scripts/inline-html.js — do not edit\n"use strict";\nmodule.exports = ${escaped};\n`;
+const out = `// AUTO-GENERATED by scripts/inline-html.mjs\n"use strict";\nmodule.exports = ${escaped};\n`;
 fs.writeFileSync(OUT, out, "utf8");
-console.log("[inline] ✅ Wrote:", OUT, `(${out.length} bytes)`);
+log("✅ Wrote:", OUT, `(${out.length} bytes)`);
