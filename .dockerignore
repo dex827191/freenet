@@ -1,0 +1,46 @@
+# ============================================
+# .dockerignore — JANGAN HAPUS BARIS node_modules
+# ============================================
+
+# ⛔ KRITIS: tanpa ini, node_modules host menimpa Linux node_modules di stage frontend
+node_modules/
+**/node_modules/
+
+# Build artifacts (Vite / Go)
+dist/
+build/
+out/
+frontend.html.cjs
+*.exe
+*.test
+
+# VCS
+.git/
+.gitignore
+.github/
+.gitlab-ci.yml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Docs & env
+README*.md
+LICENSE
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker files sendiri (tidak perlu di-copy ke image)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Log
+*.log
+npm-debug.log*
