@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 # =================================================================
 # STAGE 1: Builder BadVPN
 # =================================================================
@@ -16,14 +18,26 @@ RUN curl -fsSL https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.130.ta
 # =================================================================
 FROM node:20-slim AS frontend
 WORKDIR /web
+
+# ---- 2a) dependency (WAJIB: dev deps untuk vite, javascript-obfuscator) ----
 COPY package.json package-lock.json* ./
-RUN npm ci || npm install
+RUN if [ -f package-lock.json ]; then \
+        npm ci --include=dev --no-audit --no-fund; \
+    else \
+        npm install --include=dev --no-audit --no-fund; \
+    fi
+
+# ---- 2b) copy semua sumber ----
+#  ⚠️  `COPY . .` aman HANYA jika .dockerignore ada dan mengecualikan node_modules/
 COPY . .
 
-# 2a) Build Vite → dist/
-RUN npm run build
+# ---- 2c) build Vite ----
+RUN npm run build \
+ && echo "=== dist/ ===" && ls -la dist/ \
+ && echo "=== dist/assets/ ===" && ls -la dist/assets/ \
+ && test -f dist/index.html
 
-# 2b) Obfuscate JS assets (SEBELUM inline)
+# ---- 2d) obfuscate JS asset ----
 RUN npx --yes javascript-obfuscator@4 ./dist/assets \
     --output ./dist/assets \
     --compact true \
@@ -37,10 +51,14 @@ RUN npx --yes javascript-obfuscator@4 ./dist/assets \
     --self-defending false \
     --control-flow-flattening false \
     --dead-code-injection false \
-    --identifier-names-generator hexadecimal
+    --identifier-names-generator hexadecimal \
+ && echo "=== dist/assets setelah obfuscate ===" && ls -la dist/assets/
 
-# 2c) Inline CSS+JS+favicon → frontend.html.cjs
-RUN node scripts/inline-html.js
+# ---- 2e) inline CSS+JS+favicon → frontend.html.cjs ----
+RUN node --trace-warnings scripts/inline-html.js \
+ && echo "=== frontend.html.cjs ===" \
+ && ls -la frontend.html.cjs \
+ && wc -c frontend.html.cjs
 
 # =================================================================
 # STAGE 3: Go Binary (wsproxy)
@@ -135,7 +153,11 @@ RUN mkdir -p /etc/dropbear && \
 # Node deps panel
 # =================================================================
 COPY package.json package-lock.json* ./
-RUN npm install --omit=dev
+RUN if [ -f package-lock.json ]; then \
+        npm ci --omit=dev --no-audit --no-fund; \
+    else \
+        npm install --omit=dev --no-audit --no-fund; \
+    fi
 
 # ── App code (server.cjs hasil obfuscate) ──
 COPY --from=obfuscator /opt/server.cjs ./server.cjs
