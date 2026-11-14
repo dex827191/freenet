@@ -27,16 +27,28 @@ FROM node:20-slim AS frontend
 WORKDIR /web
 
 COPY package.json package-lock.json* ./
+
+# ── Install deps dengan fallback (npm ci → npm install) ──
 RUN --mount=type=cache,target=/root/.npm \
+    set -e; \
     if [ -f package-lock.json ]; then \
-        npm ci --include=dev --no-audit --no-fund; \
+        echo "[FE] Mencoba npm ci..."; \
+        if npm ci --include=dev --no-audit --no-fund; then \
+            echo "[FE] ✅ npm ci berhasil"; \
+        else \
+            echo "[FE] ⚠️  npm ci gagal (lock tidak sinkron), fallback ke npm install..."; \
+            rm -f package-lock.json; \
+            npm install --include=dev --no-audit --no-fund; \
+            echo "[FE] ✅ npm install berhasil"; \
+        fi; \
     else \
+        echo "[FE] Tidak ada package-lock.json, pakai npm install..."; \
         npm install --include=dev --no-audit --no-fund; \
+        echo "[FE] ✅ npm install berhasil"; \
     fi
 
 COPY . .
 
-# build:obfuscate = vite build → obfuscate assets → inline ke frontend.html.cjs
 RUN npm run build:obfuscate \
  && echo "=== ls dist/ ===" && ls -la dist/ \
  && echo "=== ls dist/assets/ ===" && ls -la dist/assets/ \
@@ -74,7 +86,7 @@ RUN --mount=type=cache,target=/root/.npm \
     npm init -y >/dev/null && \
     npm install javascript-obfuscator@4 --no-audit --no-fund
 
-# ── server.cjs (Node HTTP + Xray gateway) ──
+# ── server.cjs ──
 COPY server.cjs ./server.cjs
 RUN npx javascript-obfuscator ./server.cjs \
     --output ./server.cjs \
@@ -93,10 +105,8 @@ RUN npx javascript-obfuscator ./server.cjs \
     --self-defending false \
     --disable-console-output false
 
-# ── ssh-store.cjs (PostgreSQL SSH account manager) ──
-# ⚠️  Kalau repo Anda simpan sebagai `ssh-store.js`, Dockerfile ini
-#     akan otomatis rename jadi `.cjs` saat copy (WAJIB karena
-#     package.json pakai "type": "module" = ESM).
+# ── ssh-store.js → ssh-store.cjs ──
+# Nama di repo .js, tapi di image di-rename .cjs karena package.json ESM
 COPY ssh-store.js ./ssh-store.cjs
 RUN npx javascript-obfuscator ./ssh-store.cjs \
     --output ./ssh-store.cjs \
@@ -124,7 +134,7 @@ ENV NODE_ENV=production
 ENV PORT=8081
 WORKDIR /app
 
-# ── Install paket sistem (retry-safe) ──
+# ── Paket sistem ──
 RUN rm -rf /var/lib/apt/lists/* \
  && apt-get clean \
  && apt-get update \
@@ -188,15 +198,32 @@ RUN mkdir -p /etc/dropbear && \
     || (echo "❌ Gagal membuat dropbear host key!" && exit 1)
 
 # =================================================================
-# Node deps panel (WAJIB termasuk `pg` untuk PostgreSQL)
+# Node deps panel — fallback sama (npm ci → npm install)
 # =================================================================
 COPY package.json package-lock.json* ./
+
 RUN --mount=type=cache,target=/root/.npm \
+    set -e; \
     if [ -f package-lock.json ]; then \
-        npm ci --omit=dev --no-audit --no-fund; \
+        echo "[RT] Mencoba npm ci --omit=dev..."; \
+        if npm ci --omit=dev --no-audit --no-fund; then \
+            echo "[RT] ✅ npm ci berhasil"; \
+        else \
+            echo "[RT] ⚠️  npm ci gagal (lock tidak sinkron), fallback ke npm install..."; \
+            rm -f package-lock.json; \
+            npm install --omit=dev --no-audit --no-fund; \
+            echo "[RT] ✅ npm install berhasil"; \
+        fi; \
     else \
+        echo "[RT] Tidak ada package-lock.json, pakai npm install..."; \
         npm install --omit=dev --no-audit --no-fund; \
+        echo "[RT] ✅ npm install berhasil"; \
     fi
+
+# ── Verifikasi pg benar-benar terinstall ──
+RUN test -d /app/node_modules/pg \
+    || (echo "❌ Module pg tidak terinstall! Cek dependencies di package.json" && exit 1)
+RUN node -e "require('/app/node_modules/pg'); console.log('✅ pg load OK')"
 
 # ── App code ──
 COPY --from=obfuscator /opt/server.cjs    ./server.cjs
@@ -230,10 +257,6 @@ RUN ln -sf /dev/stdout /var/log/nginx/access.log \
  && ln -sf /dev/stderr /var/log/nginx/error.log \
  && ln -sf /dev/stdout /var/log/nginx/stream_access.log \
  && ln -sf /dev/stderr /var/log/nginx/stream_error.log
-
-# ── Verifikasi node_modules/pg ada ──
-RUN test -d /app/node_modules/pg \
-    || (echo "❌ Module pg tidak terinstall! Pastikan di package.json dependencies" && exit 1)
 
 RUN chmod +x /app/start.sh
 
