@@ -28,34 +28,108 @@ WORKDIR /web
 
 COPY package.json package-lock.json* ./
 
-# ── Install deps dengan fallback (npm ci → npm install) ──
+# ── Install deps dengan fallback npm ci → npm install ──
 RUN --mount=type=cache,target=/root/.npm \
     set -e; \
     if [ -f package-lock.json ]; then \
         echo "[FE] Mencoba npm ci..."; \
         if npm ci --include=dev --no-audit --no-fund; then \
-            echo "[FE] ✅ npm ci berhasil"; \
+            echo "[FE] ✅ npm ci OK"; \
         else \
-            echo "[FE] ⚠️  npm ci gagal (lock tidak sinkron), fallback ke npm install..."; \
+            echo "[FE] ⚠️  npm ci gagal, fallback npm install..."; \
             rm -f package-lock.json; \
             npm install --include=dev --no-audit --no-fund; \
-            echo "[FE] ✅ npm install berhasil"; \
         fi; \
     else \
-        echo "[FE] Tidak ada package-lock.json, pakai npm install..."; \
+        echo "[FE] Tidak ada lock, pakai npm install"; \
         npm install --include=dev --no-audit --no-fund; \
-        echo "[FE] ✅ npm install berhasil"; \
     fi
 
 COPY . .
 
-RUN npm run build:obfuscate \
- && echo "=== ls dist/ ===" && ls -la dist/ \
- && echo "=== ls dist/assets/ ===" && ls -la dist/assets/ \
+# ══════════════════════════════════════════════════════════════════
+# STEP 1: Vite build (murni `vite build`, tanpa obfuscate/inline)
+# ══════════════════════════════════════════════════════════════════
+RUN echo "════════ STEP 1: Vite build ════════" \
+ && npm run build
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 2: Verify hasil vite build
+# ══════════════════════════════════════════════════════════════════
+RUN echo "════════ STEP 2: Verify dist ════════" \
+ && echo "--- ls dist/ ---" \
+ && ls -la dist/ \
+ && echo "--- ls dist/assets/ ---" \
+ && ls -la dist/assets/ \
+ && echo "--- test dist/index.html ---" \
  && test -f dist/index.html \
+ || (echo "❌ dist/index.html TIDAK ADA — vite build gagal" && exit 1)
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 3: Obfuscate JS (find file .js di mana saja dalam dist/assets)
+# ══════════════════════════════════════════════════════════════════
+RUN echo "════════ STEP 3: Obfuscate JS ════════" \
+ && set -e; \
+    JS_FILES=$(find dist/assets -name "*.js" -type f 2>/dev/null | head -100); \
+    if [ -z "$JS_FILES" ]; then \
+        echo "❌ Tidak ada file .js di dist/assets/"; \
+        find dist -type f | head -50; \
+        exit 1; \
+    fi; \
+    echo "Found JS files:"; \
+    echo "$JS_FILES"; \
+    COUNT=0; \
+    for f in $JS_FILES; do \
+        echo "--- Obfuscating: $f ---"; \
+        npx --yes javascript-obfuscator@4 "$f" \
+            --output "$f" \
+            --compact true \
+            --string-array true \
+            --string-array-encoding base64 \
+            --string-array-rotate true \
+            --string-array-shuffle true \
+            --string-array-threshold 0.75 \
+            --split-strings true \
+            --split-strings-chunk-length 6 \
+            --self-defending false \
+            --control-flow-flattening false \
+            --dead-code-injection false \
+            --identifier-names-generator hexadecimal; \
+        COUNT=$((COUNT + 1)); \
+    done; \
+    echo "✅ Obfuscated $COUNT file(s)"
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 4: Inline HTML — auto-detect scripts/inline-html.{js,mjs,cjs}
+# ══════════════════════════════════════════════════════════════════
+RUN echo "════════ STEP 4: Inline HTML ════════" \
+ && set -e; \
+    echo "--- ls scripts/ ---"; \
+    ls -la scripts/ 2>/dev/null || echo "⚠️  Folder scripts/ tidak ada"; \
+    SCRIPT=""; \
+    if [ -f scripts/inline-html.mjs ]; then SCRIPT="scripts/inline-html.mjs"; \
+    elif [ -f scripts/inline-html.js ]; then SCRIPT="scripts/inline-html.js"; \
+    elif [ -f scripts/inline-html.cjs ]; then SCRIPT="scripts/inline-html.cjs"; \
+    elif [ -f scripts/inline-html.ts ]; then SCRIPT="scripts/inline-html.ts"; \
+    fi; \
+    if [ -z "$SCRIPT" ]; then \
+        echo "❌ Tidak ada scripts/inline-html.{js,mjs,cjs,ts}"; \
+        echo "--- List root files ---"; \
+        ls -la; \
+        exit 1; \
+    fi; \
+    echo "✅ Menjalankan: node $SCRIPT"; \
+    node --trace-warnings "$SCRIPT"
+
+# ══════════════════════════════════════════════════════════════════
+# STEP 5: Verify frontend.html.cjs ter-generate
+# ══════════════════════════════════════════════════════════════════
+RUN echo "════════ STEP 5: Verify frontend.html.cjs ════════" \
  && test -f frontend.html.cjs \
- && echo "=== frontend.html.cjs ===" && ls -la frontend.html.cjs && wc -c frontend.html.cjs \
- || (echo "❌ build:obfuscate gagal / frontend.html.cjs tidak ada" && exit 1)
+ && echo "✅ frontend.html.cjs berhasil dibuat:" \
+ && ls -la frontend.html.cjs \
+ && wc -c frontend.html.cjs \
+ || (echo "❌ frontend.html.cjs TIDAK ter-generate — cek output inline-html di STEP 4" && exit 1)
 
 # =================================================================
 # STAGE 3: Go Binary (wsproxy)
@@ -106,7 +180,6 @@ RUN npx javascript-obfuscator ./server.cjs \
     --disable-console-output false
 
 # ── ssh-store.js → ssh-store.cjs ──
-# Nama di repo .js, tapi di image di-rename .cjs karena package.json ESM
 COPY ssh-store.js ./ssh-store.cjs
 RUN npx javascript-obfuscator ./ssh-store.cjs \
     --output ./ssh-store.cjs \
@@ -155,17 +228,14 @@ RUN rm -rf /var/lib/apt/lists/* \
         wget \
  && rm -rf /var/lib/apt/lists/*
 
-# ── Verifikasi modul stream ──
 RUN test -f /usr/lib/nginx/modules/ngx_stream_module.so \
     || (echo "❌ modul stream tidak ditemukan!" && exit 1)
 
-# ── Node.js 20 ──
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
-# ── Cloudflared (multi-arch) ──
 ARG TARGETARCH
 RUN case "${TARGETARCH}" in \
         amd64) CF_ARCH=amd64 ;; \
@@ -176,9 +246,7 @@ RUN case "${TARGETARCH}" in \
         "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" \
  && chmod +x /usr/local/bin/cloudflared
 
-# =================================================================
-# 🔒 RENAME BINARY (anti-detection)
-# =================================================================
+# ── Rename binary ──
 COPY --from=badvpn-builder /src/badvpn-1.999.130/build/udpgw/badvpn-udpgw /tmp/raw-net
 COPY --from=go-builder /out/worker /tmp/raw-stream
 
@@ -188,18 +256,14 @@ RUN cp /usr/sbin/dropbear /usr/local/bin/svc-helper && \
     rm -f /tmp/raw-net /tmp/raw-stream /usr/sbin/dropbear && \
     chmod +x /usr/local/bin/svc-helper /usr/local/bin/net-worker /usr/local/bin/stream-worker
 
-# =================================================================
-# 🔑 GENERATE DROPBEAR HOST KEY
-# =================================================================
+# ── Dropbear host key ──
 RUN mkdir -p /etc/dropbear && \
     /usr/local/bin/svc-helper -R && \
     test -f /etc/dropbear/dropbear_rsa_host_key \
     && chmod 600 /etc/dropbear/dropbear_rsa_host_key \
     || (echo "❌ Gagal membuat dropbear host key!" && exit 1)
 
-# =================================================================
-# Node deps panel — fallback sama (npm ci → npm install)
-# =================================================================
+# ── Node deps panel ──
 COPY package.json package-lock.json* ./
 
 RUN --mount=type=cache,target=/root/.npm \
@@ -207,22 +271,18 @@ RUN --mount=type=cache,target=/root/.npm \
     if [ -f package-lock.json ]; then \
         echo "[RT] Mencoba npm ci --omit=dev..."; \
         if npm ci --omit=dev --no-audit --no-fund; then \
-            echo "[RT] ✅ npm ci berhasil"; \
+            echo "[RT] ✅ npm ci OK"; \
         else \
-            echo "[RT] ⚠️  npm ci gagal (lock tidak sinkron), fallback ke npm install..."; \
+            echo "[RT] ⚠️  npm ci gagal, fallback npm install"; \
             rm -f package-lock.json; \
             npm install --omit=dev --no-audit --no-fund; \
-            echo "[RT] ✅ npm install berhasil"; \
         fi; \
     else \
-        echo "[RT] Tidak ada package-lock.json, pakai npm install..."; \
         npm install --omit=dev --no-audit --no-fund; \
-        echo "[RT] ✅ npm install berhasil"; \
     fi
 
-# ── Verifikasi pg benar-benar terinstall ──
 RUN test -d /app/node_modules/pg \
-    || (echo "❌ Module pg tidak terinstall! Cek dependencies di package.json" && exit 1)
+    || (echo "❌ Module pg tidak terinstall!" && exit 1)
 RUN node -e "require('/app/node_modules/pg'); console.log('✅ pg load OK')"
 
 # ── App code ──
@@ -231,16 +291,15 @@ COPY --from=obfuscator /opt/ssh-store.cjs ./ssh-store.cjs
 COPY --from=frontend   /web/frontend.html.cjs ./frontend.html.cjs
 COPY start.sh ./
 
-# ── Path files (WAJIB untuk Xray) ──
 COPY pathvless.txt  ./pathvless.txt
 COPY pathvmess.txt  ./pathvmess.txt
 COPY pathtrojan.txt ./pathtrojan.txt
 
-# ── Nginx config ──
+# ── Nginx ──
 RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/*.conf
 COPY nginx/nginx.conf /etc/nginx/nginx.conf
 
-# ── Sertifikat SSL ──
+# ── SSL cert ──
 RUN mkdir -p /var/run /var/log/nginx /var/run/dropbear /etc/nginx/ssl \
  && openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
         -subj "/C=ID/ST=Jakarta/L=Jakarta/O=App/CN=app.local" \
@@ -248,11 +307,9 @@ RUN mkdir -p /var/run /var/log/nginx /var/run/dropbear /etc/nginx/ssl \
         -out    /etc/nginx/ssl/server.crt \
  && chmod 600 /etc/nginx/ssl/server.key
 
-# ── Validasi nginx ──
 RUN nginx -t -c /etc/nginx/nginx.conf 2>&1 || \
     (echo "❌ nginx.conf tidak valid!" && exit 1)
 
-# ── Log ke stdout ──
 RUN ln -sf /dev/stdout /var/log/nginx/access.log \
  && ln -sf /dev/stderr /var/log/nginx/error.log \
  && ln -sf /dev/stdout /var/log/nginx/stream_access.log \
