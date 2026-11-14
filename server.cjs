@@ -7,6 +7,7 @@ const os = require('os');
 const fs = require("fs");
 const path = require("path");
 const { exec } = require('child_process');
+const sshStore = require('./ssh-store.cjs');   // ⚠️ WAJIB .cjs
 
 // ========================================================
 // KONFIG GLOBAL
@@ -27,7 +28,6 @@ const WS_PROXY_CONFIG_FILE = "/tmp/ws_proxy_config.json";
 const SYSTEM_CONFIG_FILE = "/tmp/system_config.json";
 const ADMIN_PASS_FILE = "/tmp/admin_pass.txt";
 const STATS_PATH = "/tmp/server_stats.json";
-const DB_PATH = "/tmp/ssh_details.json";
 const NODE_LINKS_FILE = "/tmp/node_links.json";
 
 // ========================================================
@@ -119,13 +119,43 @@ let webPath = path.join(FILE_PATH, webName);
 let botPath = path.join(FILE_PATH, botName);
 let subPath = path.join(FILE_PATH, 'sub.txt');
 
-function loadDb() {
-    if (fs.existsSync(DB_PATH)) { try { return JSON.parse(fs.readFileSync(DB_PATH, 'utf8')); } catch (e) { return {}; } }
-    return {};
-}
-function saveDb(d) { try { fs.writeFileSync(DB_PATH, JSON.stringify(d, null, 2)); } catch (e) {} }
-
 let currentActiveDomain = '';
+
+// ========================================================
+// SSH WRAPPERS (delegate ke ssh-store.cjs)
+// ========================================================
+async function listSsh() {
+    try {
+        return await sshStore.listAccounts(true);
+    } catch (e) {
+        console.error('[SSH] listAccounts gagal:', e.message);
+        return { status: 'error', message: `Gagal membaca DB: ${e.message}` };
+    }
+}
+
+async function addSsh(username, password, ipAddr, userAgent) {
+    const result = await sshStore.addAccount(username, password, ipAddr, userAgent);
+    if (result.status !== 'success') return result;
+
+    const host = getCurrentHosts();
+    return {
+        status: 'success',
+        message:
+            `================================\n       SSH ACCOUNT CREATED      \n================================\n` +
+            `Host SSH  : ${host}\nPort TLS  : 443\nPort NTLS : 80\n` +
+            `Username  : ${result.username}\nPassword  : ${result.password}\n` +
+            `================================\n powered by : Freedom\n================================`
+    };
+}
+
+async function deleteSsh(username) {
+    try {
+        return await sshStore.deleteAccount(username);
+    } catch (e) {
+        console.error('[SSH] deleteAccount gagal:', e.message);
+        return { status: 'error', message: `Gagal menghapus: ${e.message}` };
+    }
+}
 
 // ========================================================
 // TUNNEL MANAGEMENT
@@ -179,48 +209,6 @@ function getCurrentHosts() {
 }
 
 // ========================================================
-// SSH MANAGEMENT
-// ========================================================
-function listSsh() {
-    try {
-        const users = []; const dbInfo = loadDb();
-        if (!fs.existsSync('/etc/passwd')) return { status: "success", total: 0, users: [] };
-        for (const line of fs.readFileSync('/etc/passwd', 'utf8').split('\n')) {
-            if (!line.trim()) continue;
-            const parts = line.split(':');
-            const username = parts[0], uid = parseInt(parts[2], 10);
-            if (uid >= 1000 && !["nobody","ubuntu","sshd","dropbear","stunnel"].includes(username)) {
-                users.push({ username, uid, shell: parts[parts.length-1], ...(dbInfo[username] || { password: "-", ip: "Unknown", user_agent: "Unknown" }) });
-            }
-        }
-        return { status: "success", total: users.length, users };
-    } catch (e) { return { status: "error", message: e.message }; }
-}
-function addSsh(username, password, ipAddr, userAgent) {
-    if (!username || !password) return { status: "error", message: "Username dan password wajib diisi!" };
-    if (!/^[a-zA-Z0-9_-]+$/.test(username) || !/^[a-zA-Z0-9_@.-]+$/.test(password))
-        return { status: "error", message: "Karakter ilegal!" };
-    try {
-        exec(`useradd -m -s /bin/bash ${username}`);
-        exec(`echo '${username}:${password}' | chpasswd`);
-        const db = loadDb(); db[username] = { password, ip: ipAddr, user_agent: userAgent }; saveDb(db);
-        const host = getCurrentHosts();
-        return { status: "success", message:
-            `================================\n       SSH ACCOUNT CREATED      \n================================\n` +
-            `Host SSH  : ${host}\nPort TLS  : 443\nPort NTLS : 80\nUsername  : ${username}\nPassword  : ${password}\n` +
-            `================================\n powered by : Freedom\n================================` };
-    } catch (e) { return { status: "error", message: `Gagal membuat user (mungkin sudah ada).` }; }
-}
-function deleteSsh(username) {
-    if (!username || !/^[a-zA-Z0-9_-]+$/.test(username)) return { status: "error", message: "Username ilegal!" };
-    try {
-        exec(`userdel -r ${username} 2>/dev/null || true`);
-        const db = loadDb(); if (db[username]) { delete db[username]; saveDb(db); }
-        return { status: "success", message: `User ${username} dihapus!` };
-    } catch (e) { return { status: "error", message: `Gagal menghapus user.` }; }
-}
-
-// ========================================================
 // XRAY CONFIG — DUAL TRANSPORT
 // ========================================================
 function readPathsFromFile(filename, defaultPath) {
@@ -232,13 +220,11 @@ function readPathsFromFile(filename, defaultPath) {
   } catch (e) {}
   return [defaultPath];
 }
-
 function resolveTransports(engine) {
     if (engine === 'ws' || engine === 'httpupgrade') return ['httpupgrade', 'ws'];
     if (['grpc','h2','tcp'].includes(engine)) return [engine];
     return ['httpupgrade', 'ws'];
 }
-
 function resolvePath(basePath, transport, engine) {
     if (transport === engine) return basePath;
     if (transport === 'ws') return basePath + '-ws';
@@ -367,9 +353,6 @@ async function getMetaInfo() {
   catch(e) { return 'RailwayServer'; }
 }
 
-// ========================================================
-// GENERATE LINKS
-// ========================================================
 async function generateLinks(argoDomain) {
   const netSettings = getNetworkSettings();
   const engine = netSettings.engine || 'httpupgrade';
@@ -518,7 +501,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(subContent || (fs.existsSync(subPath) ? fs.readFileSync(subPath, 'utf-8') : 'Loading sub...'));
     }
 
-    // INFO PAGES (non-upgrade request)
+    // Info pages
     if (!req.headers.upgrade) {
         const infoMap = { '/vless-argo': 'vless', '/vmess-argo': 'vmess', '/trojan-argo': 'trojan' };
         const proto = infoMap[pathName];
@@ -617,9 +600,22 @@ const server = http.createServer(async (req, res) => {
         if (fs.existsSync(CFIP_FILE)) fs.unlinkSync(CFIP_FILE);
         return res.end(JSON.stringify({ status:"success", message:"CFIP Direset." }));
     }
-    if (pathName === '/api/add')    { res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(addSsh(query.user, query.pass, ipAddr, userAgent))); }
-    if (pathName === '/api/delete') { res.writeHead(200,{'Content-Type':'application/json'}); if (!verifyAdminPassword(query.token)) return res.end(JSON.stringify({ status:"error", message:"Akses Ditolak!" })); return res.end(JSON.stringify(deleteSsh(query.user))); }
-    if (pathName === '/api/list')   { res.writeHead(200,{'Content-Type':'application/json'}); return res.end(JSON.stringify(listSsh())); }
+
+    // SSH ENDPOINTS (async → PostgreSQL)
+    if (pathName === '/api/add') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(await addSsh(query.user, query.pass, ipAddr, userAgent)));
+    }
+    if (pathName === '/api/delete') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        if (!verifyAdminPassword(query.token)) return res.end(JSON.stringify({ status:"error", message:"Akses Ditolak!" }));
+        return res.end(JSON.stringify(await deleteSsh(query.user)));
+    }
+    if (pathName === '/api/list') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(await listSsh()));
+    }
+
     if (pathName === '/api/login') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         if (getAdminPassword() === null) return res.end(JSON.stringify({ status:"not_configured", message:"Password Admin belum dibuat!" }));
@@ -658,6 +654,7 @@ const server = http.createServer(async (req, res) => {
             engine_mode: netSettings.engine,
             ws_proxy_cfg: wsProxyCfg,
             sys_settings: sysSettings,
+            db_mode: 'postgres',
             ...hwInfo,
             ssh_online: String(hwInfo.ssh_online).replace(/👥/g,'').replace(/Active/g,'').replace(/Users/g,'').trim() || "0"
         }));
@@ -671,7 +668,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ========================================================
-// WS / HTTPUPGRADE FORWARDER
+// WEBSOCKET / HTTPUPGRADE FORWARDER
 // ========================================================
 function forwardWebsocket(targetPort, req, socket, head) {
     const net = require('net');
@@ -700,8 +697,27 @@ server.on('upgrade', (req, socket, head) => {
 // ========================================================
 // START
 // ========================================================
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
     console.log(`[Engine] Running on :${PORT} | UUID: ${UUID}`);
+    console.log(`[DB] Mode: PostgreSQL`);
+
+    // Restore SSH accounts (background, retry up to 10x)
+    (async function restoreLoop() {
+        for (let i = 1; i <= 10; i++) {
+            try {
+                await sshStore.ensureSchema();
+                const s = await sshStore.restoreAccounts();
+                console.log(`[SSH] ✅ Restore — total:${s.total} created:${s.restored} exists:${s.alreadyPresent} failed:${s.failures.length}`);
+                if (s.failures.length > 0) console.error('[SSH] Failures:', s.failures);
+                return;
+            } catch (e) {
+                console.error(`[SSH] Restore ${i}/10 gagal: ${e.message}`);
+                await new Promise(r => setTimeout(r, 3000));
+            }
+        }
+        console.error('[SSH] ❌ Restore gagal setelah 10 percobaan — panel tetap jalan');
+    })();
+
     generateConfig().then(() => downloadFilesAndRun()).then(() => extractDomains()).catch(e => console.error(e));
 
     if (fs.existsSync(ZT_SINGLE_TOKEN_FILE)) {
