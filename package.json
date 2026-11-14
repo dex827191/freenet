@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "main": "server.cjs",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -10,12 +11,15 @@
     "build:obfuscate": "npm run build && npx --yes javascript-obfuscator@4 ./dist/assets --output ./dist/assets --compact true --string-array true --string-array-encoding base64 --string-array-rotate true --string-array-shuffle true --string-array-threshold 0.75 --split-strings true --split-strings-chunk-length 6 --self-defending false --identifier-names-generator hexadecimal && node scripts/inline-html.js",
     "lint": "eslint .",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.app.json"
+    "typecheck": "tsc --noEmit -p tsconfig.app.json",
+    "start": "node server.cjs",
+    "restore-ssh": "node ssh-store.cjs restore"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",
     "axios": "^1.7.7",
     "lucide-react": "^0.446.0",
+    "pg": "^8.11.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
