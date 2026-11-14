@@ -408,7 +408,77 @@ async function generateLinks(argoDomain) {
 }
 
 // ========================================================
-// INFO PAGE RENDERER
+// 🆕 RAW TEXT BUILDERS (untuk /sub.txt, /vless-argo.txt, dll)
+// ========================================================
+function buildProtoPlainText(protocol, links, domain) {
+    const lines = [];
+    lines.push(`# ════════════════════════════════════════════════════════════════`);
+    lines.push(`# ${protocol.toUpperCase()} NODES — RAW TEXT VIEW`);
+    lines.push(`# ════════════════════════════════════════════════════════════════`);
+    lines.push(`# Server    : ${domain || 'N/A'}`);
+    lines.push(`# CFIP      : ${getActiveCfip()}`);
+    lines.push(`# Port      : ${CFPORT}`);
+    lines.push(`# UUID      : ${UUID}`);
+    lines.push(`# Generated : ${new Date().toISOString()}`);
+    lines.push(`# ════════════════════════════════════════════════════════════════`);
+    lines.push('');
+
+    const entries = Object.entries(links).filter(([_, v]) => v);
+    if (entries.length === 0) {
+        lines.push('# (Belum ada link — tunggu tunnel aktif)');
+        return lines.join('\n') + '\n';
+    }
+
+    entries.forEach(([transport, link]) => {
+        const header = transport === 'httpupgrade'
+            ? '📡 HTTPUpgrade (Recommended)'
+            : transport === 'ws'
+                ? '🔌 WebSocket'
+                : `⚙️  ${transport.toUpperCase()}`;
+        lines.push(`# ${header}`);
+        lines.push(link);
+        lines.push('');
+    });
+
+    return lines.join('\n') + '\n';
+}
+
+function buildAllPlainText(linksData, domain) {
+    const lines = [];
+    lines.push(`# ════════════════════════════════════════════════════════════════`);
+    lines.push(`# ALL NODES — RAW TEXT VIEW`);
+    lines.push(`# ════════════════════════════════════════════════════════════════`);
+    lines.push(`# Server    : ${domain || 'N/A'}`);
+    lines.push(`# CFIP      : ${getActiveCfip()}`);
+    lines.push(`# Port      : ${CFPORT}`);
+    lines.push(`# UUID      : ${UUID}`);
+    lines.push(`# Generated : ${new Date().toISOString()}`);
+    lines.push(`# ════════════════════════════════════════════════════════════════`);
+    lines.push('');
+
+    ['vless', 'vmess', 'trojan'].forEach(proto => {
+        const links = linksData[proto] || {};
+        const entries = Object.entries(links).filter(([_, v]) => v);
+        if (entries.length === 0) return;
+        lines.push(`# ┌──────────────────────────────────────────────────┐`);
+        lines.push(`# │ ${proto.toUpperCase().padEnd(46)} │`);
+        lines.push(`# └──────────────────────────────────────────────────┘`);
+        entries.forEach(([transport, link]) => {
+            lines.push(`# --- ${transport.toUpperCase()} ---`);
+            lines.push(link);
+        });
+        lines.push('');
+    });
+
+    if (lines.length < 10) {
+        lines.push('# (Belum ada link — tunggu tunnel aktif)');
+    }
+
+    return lines.join('\n') + '\n';
+}
+
+// ========================================================
+// INFO PAGE RENDERER (HTML)
 // ========================================================
 function renderInfoPage(protocol, links, argoDomain) {
   const rows = Object.entries(links).filter(([_, v]) => v).map(([transport, link]) => {
@@ -421,6 +491,9 @@ function renderInfoPage(protocol, links, argoDomain) {
       <button class="copy-btn" onclick="copyText(this)">📋 Copy</button>
     </div>`;
   }).join('');
+
+  // Link ke raw view
+  const rawHref = `/${protocol}-argo.txt`;
 
   return `<!DOCTYPE html>
 <html><head>
@@ -440,12 +513,15 @@ function renderInfoPage(protocol, links, argoDomain) {
   .copy-btn{background:#238636;color:white;border:0;padding:10px 18px;border-radius:8px;cursor:pointer;margin-top:10px;font-weight:600;font-size:13px;transition:all .2s}
   .copy-btn:hover{background:#2ea043;transform:translateY(-1px)}
   .copy-btn.done{background:#1f6feb}
+  .raw-btn{display:inline-block;margin-bottom:16px;padding:10px 18px;background:#1f6feb;color:#fff;text-decoration:none;border-radius:8px;font-weight:600;font-size:13px;transition:all .2s}
+  .raw-btn:hover{background:#388bfd;transform:translateY(-1px)}
   .footer{text-align:center;color:#484f58;font-size:12px;margin-top:32px;padding-top:20px;border-top:1px solid #21262d}
   .badge{display:inline-block;background:#1f6feb;color:white;padding:2px 10px;border-radius:20px;font-size:11px;margin-left:8px;font-weight:600}
 </style>
 </head><body>
 <div class="container">
   <h1>🔐 ${protocol.toUpperCase()} NODE <span class="badge">DUAL</span></h1>
+  <a href="${rawHref}" class="raw-btn" target="_blank">📄 View as Raw Text (GitHub-style)</a>
   <div class="meta">
     <div><strong>Server:</strong> <span>${argoDomain || 'N/A'}</span></div>
     <div><strong>CFIP:</strong> <span>${getActiveCfip()}</span></div>
@@ -495,13 +571,54 @@ const server = http.createServer(async (req, res) => {
     const userAgent = req.headers['user-agent'] || "Unknown UA";
     res.setHeader('Access-Control-Allow-Origin', '*');
 
-    // Subscription
-    if (pathName === `/${SUB_PATH}`) {
+    // ──────────────────────────────────────────────────────
+    // SUBSCRIPTION (BASE64 — untuk import client v2rayN/NekoBox)
+    // ──────────────────────────────────────────────────────
+    if (pathName === `/${SUB_PATH}` && !query.raw) {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
         return res.end(subContent || (fs.existsSync(subPath) ? fs.readFileSync(subPath, 'utf-8') : 'Loading sub...'));
     }
 
-    // Info pages
+    // ──────────────────────────────────────────────────────
+    // 🆕 RAW TEXT — /sub.txt, /sub/raw, /raw
+    // ──────────────────────────────────────────────────────
+    const isAllRaw = pathName === '/sub.txt' ||
+                     pathName === '/sub/raw' ||
+                     pathName === `/${SUB_PATH}.txt` ||
+                     pathName === `/${SUB_PATH}/raw` ||
+                     pathName === '/raw';
+    if (isAllRaw) {
+        let linksData = {};
+        try { if (fs.existsSync(NODE_LINKS_FILE)) linksData = JSON.parse(fs.readFileSync(NODE_LINKS_FILE, 'utf8')); } catch(e) {}
+        const text = buildAllPlainText(linksData, currentActiveDomain);
+        res.writeHead(200, {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': 'no-cache',
+            'X-Content-Type-Options': 'nosniff'
+        });
+        return res.end(text);
+    }
+
+    // ──────────────────────────────────────────────────────
+    // 🆕 RAW TEXT per-protocol — /vless-argo.txt, /vless/raw, dll
+    // ──────────────────────────────────────────────────────
+    const protoRawMatch = pathName.match(/^\/(vless|vmess|trojan)(?:-argo)?(?:\.txt|\/raw)$/);
+    if (protoRawMatch) {
+        const proto = protoRawMatch[1];
+        let linksData = {};
+        try { if (fs.existsSync(NODE_LINKS_FILE)) linksData = JSON.parse(fs.readFileSync(NODE_LINKS_FILE, 'utf8')); } catch(e) {}
+        const text = buildProtoPlainText(proto, linksData[proto] || {}, currentActiveDomain);
+        res.writeHead(200, {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': 'no-cache',
+            'X-Content-Type-Options': 'nosniff'
+        });
+        return res.end(text);
+    }
+
+    // ──────────────────────────────────────────────────────
+    // INFO PAGES (HTML) — /vless-argo, /vmess-argo, /trojan-argo
+    // ──────────────────────────────────────────────────────
     if (!req.headers.upgrade) {
         const infoMap = { '/vless-argo': 'vless', '/vmess-argo': 'vmess', '/trojan-argo': 'trojan' };
         const proto = infoMap[pathName];
@@ -513,6 +630,7 @@ const server = http.createServer(async (req, res) => {
         }
     }
 
+    // __info
     if (pathName === '/__info') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
@@ -601,7 +719,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ status:"success", message:"CFIP Direset." }));
     }
 
-    // SSH ENDPOINTS (async → PostgreSQL)
+    // SSH ENDPOINTS
     if (pathName === '/api/add') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify(await addSsh(query.user, query.pass, ipAddr, userAgent)));
@@ -701,7 +819,6 @@ server.listen(PORT, async () => {
     console.log(`[Engine] Running on :${PORT} | UUID: ${UUID}`);
     console.log(`[DB] Mode: PostgreSQL`);
 
-    // Restore SSH accounts (background, retry up to 10x)
     (async function restoreLoop() {
         for (let i = 1; i <= 10; i++) {
             try {
