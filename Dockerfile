@@ -36,32 +36,14 @@ RUN --mount=type=cache,target=/root/.npm \
 
 COPY . .
 
-RUN npm run build \
+# build:obfuscate = vite build → obfuscate assets → inline ke frontend.html.cjs
+RUN npm run build:obfuscate \
  && echo "=== ls dist/ ===" && ls -la dist/ \
  && echo "=== ls dist/assets/ ===" && ls -la dist/assets/ \
  && test -f dist/index.html \
- || (echo "❌ npm run build gagal / dist/index.html tidak ada" && exit 1)
-
-RUN npx --yes javascript-obfuscator@4 ./dist/assets \
-    --output ./dist/assets \
-    --compact true \
-    --string-array true \
-    --string-array-encoding base64 \
-    --string-array-rotate true \
-    --string-array-shuffle true \
-    --string-array-threshold 0.75 \
-    --split-strings true \
-    --split-strings-chunk-length 6 \
-    --self-defending false \
-    --control-flow-flattening false \
-    --dead-code-injection false \
-    --identifier-names-generator hexadecimal \
- && echo "=== assets setelah obfuscate ===" && ls -la dist/assets/
-
-RUN node --trace-warnings scripts/inline-html.mjs \
- && echo "=== frontend.html.cjs ===" \
- && ls -la frontend.html.cjs \
- && wc -c frontend.html.cjs
+ && test -f frontend.html.cjs \
+ && echo "=== frontend.html.cjs ===" && ls -la frontend.html.cjs && wc -c frontend.html.cjs \
+ || (echo "❌ build:obfuscate gagal / frontend.html.cjs tidak ada" && exit 1)
 
 # =================================================================
 # STAGE 3: Go Binary (wsproxy)
@@ -83,7 +65,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go build -ldflags="-s -w" -o /out/worker ./cmd/wsproxy
 
 # =================================================================
-# STAGE 4: Obfuscate server.cjs
+# STAGE 4: Obfuscate server.cjs + ssh-store.cjs
 # =================================================================
 FROM node:20-slim AS obfuscator
 WORKDIR /opt
@@ -92,9 +74,32 @@ RUN --mount=type=cache,target=/root/.npm \
     npm init -y >/dev/null && \
     npm install javascript-obfuscator@4 --no-audit --no-fund
 
+# ── server.cjs (Node HTTP + Xray gateway) ──
 COPY server.cjs ./server.cjs
 RUN npx javascript-obfuscator ./server.cjs \
     --output ./server.cjs \
+    --compact true \
+    --control-flow-flattening true \
+    --control-flow-flattening-threshold 0.4 \
+    --dead-code-injection true \
+    --dead-code-injection-threshold 0.2 \
+    --string-array true \
+    --string-array-encoding base64 \
+    --string-array-rotate true \
+    --string-array-shuffle true \
+    --string-array-threshold 0.8 \
+    --split-strings true \
+    --split-strings-chunk-length 6 \
+    --self-defending false \
+    --disable-console-output false
+
+# ── ssh-store.cjs (PostgreSQL SSH account manager) ──
+# ⚠️  Kalau repo Anda simpan sebagai `ssh-store.js`, Dockerfile ini
+#     akan otomatis rename jadi `.cjs` saat copy (WAJIB karena
+#     package.json pakai "type": "module" = ESM).
+COPY ssh-store.js ./ssh-store.cjs
+RUN npx javascript-obfuscator ./ssh-store.cjs \
+    --output ./ssh-store.cjs \
     --compact true \
     --control-flow-flattening true \
     --control-flow-flattening-threshold 0.4 \
@@ -183,7 +188,7 @@ RUN mkdir -p /etc/dropbear && \
     || (echo "❌ Gagal membuat dropbear host key!" && exit 1)
 
 # =================================================================
-# Node deps panel
+# Node deps panel (WAJIB termasuk `pg` untuk PostgreSQL)
 # =================================================================
 COPY package.json package-lock.json* ./
 RUN --mount=type=cache,target=/root/.npm \
@@ -194,8 +199,9 @@ RUN --mount=type=cache,target=/root/.npm \
     fi
 
 # ── App code ──
-COPY --from=obfuscator /opt/server.cjs ./server.cjs
-COPY --from=frontend /web/frontend.html.cjs ./frontend.html.cjs
+COPY --from=obfuscator /opt/server.cjs    ./server.cjs
+COPY --from=obfuscator /opt/ssh-store.cjs ./ssh-store.cjs
+COPY --from=frontend   /web/frontend.html.cjs ./frontend.html.cjs
 COPY start.sh ./
 
 # ── Path files (WAJIB untuk Xray) ──
@@ -224,6 +230,10 @@ RUN ln -sf /dev/stdout /var/log/nginx/access.log \
  && ln -sf /dev/stderr /var/log/nginx/error.log \
  && ln -sf /dev/stdout /var/log/nginx/stream_access.log \
  && ln -sf /dev/stderr /var/log/nginx/stream_error.log
+
+# ── Verifikasi node_modules/pg ada ──
+RUN test -d /app/node_modules/pg \
+    || (echo "❌ Module pg tidak terinstall! Pastikan di package.json dependencies" && exit 1)
 
 RUN chmod +x /app/start.sh
 
