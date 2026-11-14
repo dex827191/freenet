@@ -5,8 +5,15 @@
 # =================================================================
 FROM ubuntu:22.04 AS badvpn-builder
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y cmake make gcc g++ curl tar \
+
+RUN rm -rf /var/lib/apt/lists/* \
+ && apt-get clean \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        cmake make gcc g++ curl tar \
  && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /src
 RUN curl -fsSL https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.130.tar.gz | tar -xz \
  && cd badvpn-1.999.130 && mkdir build && cd build \
@@ -19,7 +26,6 @@ RUN curl -fsSL https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.130.ta
 FROM node:20-slim AS frontend
 WORKDIR /web
 
-# ── 2a) Install SEMUA deps (dev + prod) dengan cache mount ──
 COPY package.json package-lock.json* ./
 RUN --mount=type=cache,target=/root/.npm \
     if [ -f package-lock.json ]; then \
@@ -28,18 +34,14 @@ RUN --mount=type=cache,target=/root/.npm \
         npm install --include=dev --no-audit --no-fund; \
     fi
 
-# ── 2b) Copy semua sumber ──
-#      ⚠️  Pastikan .dockerignore TIDAK mengecualikan scripts/, src/, public/
 COPY . .
 
-# ── 2c) Build Vite + verifikasi output ──
 RUN npm run build \
  && echo "=== ls dist/ ===" && ls -la dist/ \
  && echo "=== ls dist/assets/ ===" && ls -la dist/assets/ \
  && test -f dist/index.html \
  || (echo "❌ npm run build gagal / dist/index.html tidak ada" && exit 1)
 
-# ── 2d) Obfuscate JS assets ──
 RUN npx --yes javascript-obfuscator@4 ./dist/assets \
     --output ./dist/assets \
     --compact true \
@@ -56,7 +58,6 @@ RUN npx --yes javascript-obfuscator@4 ./dist/assets \
     --identifier-names-generator hexadecimal \
  && echo "=== assets setelah obfuscate ===" && ls -la dist/assets/
 
-# ── 2e) Inline CSS+JS+favicon → frontend.html.cjs ──
 RUN node --trace-warnings scripts/inline-html.mjs \
  && echo "=== frontend.html.cjs ===" \
  && ls -la frontend.html.cjs \
@@ -69,10 +70,12 @@ FROM --platform=$BUILDPLATFORM golang:1.22-bookworm AS go-builder
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /build
+
 COPY go.mod go.sum* ./
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go mod download
+
 COPY cmd/ ./cmd/
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
@@ -84,9 +87,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # =================================================================
 FROM node:20-slim AS obfuscator
 WORKDIR /opt
+
 RUN --mount=type=cache,target=/root/.npm \
     npm init -y >/dev/null && \
     npm install javascript-obfuscator@4 --no-audit --no-fund
+
 COPY server.cjs ./server.cjs
 RUN npx javascript-obfuscator ./server.cjs \
     --output ./server.cjs \
@@ -114,17 +119,26 @@ ENV NODE_ENV=production
 ENV PORT=8081
 WORKDIR /app
 
-# ── Paket sistem ──
-RUN apt-get update && apt-get install -y \
-    dropbear \
-    nginx-full \
-    libnginx-mod-stream \
-    openssl \
-    ca-certificates \
-    procps psmisc net-tools iproute2 \
-    bash jq sudo \
-    curl wget \
-    && rm -rf /var/lib/apt/lists/*
+# ── Install paket sistem (retry-safe) ──
+RUN rm -rf /var/lib/apt/lists/* \
+ && apt-get clean \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends \
+        dropbear \
+        nginx-full \
+        libnginx-mod-stream \
+        openssl \
+        procps \
+        psmisc \
+        net-tools \
+        iproute2 \
+        bash \
+        jq \
+        sudo \
+        curl \
+        wget \
+ && rm -rf /var/lib/apt/lists/*
 
 # ── Verifikasi modul stream ──
 RUN test -f /usr/lib/nginx/modules/ngx_stream_module.so \
@@ -132,8 +146,9 @@ RUN test -f /usr/lib/nginx/modules/ngx_stream_module.so \
 
 # ── Node.js 20 ──
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
- && apt-get install -y nodejs \
- && apt-get clean && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends nodejs \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
 
 # ── Cloudflared (multi-arch) ──
 ARG TARGETARCH
@@ -182,6 +197,11 @@ RUN --mount=type=cache,target=/root/.npm \
 COPY --from=obfuscator /opt/server.cjs ./server.cjs
 COPY --from=frontend /web/frontend.html.cjs ./frontend.html.cjs
 COPY start.sh ./
+
+# ── Path files (WAJIB untuk Xray) ──
+COPY pathvless.txt  ./pathvless.txt
+COPY pathvmess.txt  ./pathvmess.txt
+COPY pathtrojan.txt ./pathtrojan.txt
 
 # ── Nginx config ──
 RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/*.conf
