@@ -2,24 +2,38 @@
 
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
 const { execFileSync } = require('child_process');
-const { Pool } = require('pg');
 
 // ========================================================
-// DB CONNECTION
+// DATA DIR (auto-detect writable, prioritas /app/data)
 // ========================================================
-const DATABASE_URL = process.env.DATABASE_URL;
-if (!DATABASE_URL) {
-  throw new Error('DATABASE_URL tidak ditemukan. Hubungkan layanan PostgreSQL ke aplikasi.');
-}
+const DATA_DIR = (() => {
+  const candidates = [
+    process.env.DATA_DIR,
+    '/app/data',
+    '/data',
+    process.env.FILE_PATH,
+    '.tmp',
+  ].filter(Boolean);
 
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  max: 5,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 15000,
-  ssl: process.env.PGSSL === 'true' ? { rejectUnauthorized: false } : undefined,
-});
+  for (const d of candidates) {
+    try {
+      if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+      fs.accessSync(d, fs.constants.W_OK);
+      return d;
+    } catch (_) {}
+  }
+  console.warn('[SSH-STORE] ⚠️  Tidak ada direktori writable, fallback /tmp (TIDAK PERSISTEN!)');
+  return '/tmp';
+})();
+
+const DB_PATH = path.join(DATA_DIR, 'ssh_accounts.json');
+const DB_BACKUP = DB_PATH + '.bak';
+const DB_TEMP_PREFIX = DB_PATH + '.tmp.';
+
+console.log(`[SSH-STORE] 📁 Data dir: ${DATA_DIR}`);
+console.log(`[SSH-STORE] 📄 DB path : ${DB_PATH}`);
 
 // ========================================================
 // KONSTANTA
@@ -30,17 +44,18 @@ const RESERVED_USERS = new Set([
   'nobody', 'ubuntu', 'sshd', 'dropbear', 'stunnel'
 ]);
 
-let schemaPromise;
-
 // ========================================================
 // ENCRYPTION (AES-256-GCM)
 // ========================================================
+let _keyCache = null;
 function getEncryptionKey() {
+  if (_keyCache) return _keyCache;
   const raw = (process.env.SSH_CREDENTIALS_KEY || '').trim();
   if (!/^[a-f0-9]{64}$/i.test(raw)) {
-    throw new Error('SSH_CREDENTIALS_KEY belum diatur. Gunakan kunci hex 64 karakter (32 byte).');
+    throw new Error('SSH_CREDENTIALS_KEY belum diatur. Gunakan 64 hex chars (openssl rand -hex 32).');
   }
-  return Buffer.from(raw, 'hex');
+  _keyCache = Buffer.from(raw, 'hex');
+  return _keyCache;
 }
 
 function encryptPassword(password) {
@@ -55,12 +70,12 @@ function encryptPassword(password) {
   };
 }
 
-function decryptPassword(row) {
+function decryptPassword(entry) {
   const key = getEncryptionKey();
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(row.password_iv, 'hex'));
-  decipher.setAuthTag(Buffer.from(row.password_tag, 'hex'));
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(entry.password_iv, 'hex'));
+  decipher.setAuthTag(Buffer.from(entry.password_tag, 'hex'));
   return Buffer.concat([
-    decipher.update(Buffer.from(row.password_ciphertext, 'base64')),
+    decipher.update(Buffer.from(entry.password_ciphertext, 'base64')),
     decipher.final()
   ]).toString('utf8');
 }
@@ -77,33 +92,58 @@ function validateUsername(username) {
 }
 
 function validatePassword(password) {
-  // Regex sengaja ketat — mencegah chpasswd injection (tidak boleh ':')
   return typeof password === 'string' &&
     password.length >= 4 && password.length <= 128 &&
     /^[a-zA-Z0-9_@.-]+$/.test(password);
 }
 
 // ========================================================
-// SCHEMA
+// FILE I/O — atomic write + backup + recovery
 // ========================================================
-async function ensureSchema() {
-  if (!schemaPromise) {
-    schemaPromise = pool.query(`
-      CREATE TABLE IF NOT EXISTS ssh_accounts (
-        username VARCHAR(32) PRIMARY KEY,
-        password_ciphertext TEXT NOT NULL,
-        password_iv VARCHAR(24) NOT NULL,
-        password_tag VARCHAR(32) NOT NULL,
-        ip_address TEXT NOT NULL DEFAULT 'Unknown',
-        user_agent TEXT NOT NULL DEFAULT 'Unknown',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `).catch((error) => {
-      schemaPromise = null;
-      throw error;
-    });
+function loadDb() {
+  // Try main DB
+  for (const candidate of [DB_PATH, DB_BACKUP]) {
+    if (!fs.existsSync(candidate)) continue;
+    try {
+      const raw = fs.readFileSync(candidate, 'utf8');
+      if (!raw.trim()) continue;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        if (candidate === DB_BACKUP) {
+          console.warn(`[SSH-STORE] ⚠️  Loaded dari backup (main corrupt)`);
+          try { fs.copyFileSync(DB_BACKUP, DB_PATH); } catch (_) {}
+        }
+        return parsed;
+      }
+    } catch (e) {
+      console.error(`[SSH-STORE] ❌ Corrupt ${candidate}: ${e.message}`);
+    }
   }
-  await schemaPromise;
+  return {};
+}
+
+function saveDb(data) {
+  const tmp = DB_TEMP_PREFIX + process.pid + '.' + Date.now();
+  try {
+    // Backup existing DB dulu
+    if (fs.existsSync(DB_PATH)) {
+      try { fs.copyFileSync(DB_PATH, DB_BACKUP); } catch (_) {}
+    }
+    // Atomic write
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, DB_PATH);
+    // Cleanup orphan .tmp files (kalau ada dari crash sebelumnya)
+    try {
+      fs.readdirSync(DATA_DIR)
+        .filter(f => f.startsWith(path.basename(DB_PATH) + '.tmp.'))
+        .forEach(f => { try { fs.unlinkSync(path.join(DATA_DIR, f)); } catch (_) {} });
+    } catch (_) {}
+    return true;
+  } catch (e) {
+    console.error(`[SSH-STORE] ❌ Save failed: ${e.message}`);
+    try { fs.unlinkSync(tmp); } catch (_) {}
+    return false;
+  }
 }
 
 // ========================================================
@@ -136,11 +176,9 @@ function createLinuxUser(username) {
 }
 
 function deleteLinuxUser(username) {
-  // Kill proses user dulu
   try {
     execFileSync('pkill', ['-9', '-u', username], { stdio: ['ignore', 'ignore', 'ignore'] });
   } catch (_) {}
-  // Hapus user
   execFileSync('userdel', ['-r', '--', username], {
     encoding: 'utf8', stdio: ['ignore', 'ignore', 'pipe']
   });
@@ -159,13 +197,10 @@ async function addAccount(username, password, ipAddress, userAgent) {
 
   let createdLinuxUser = false;
   try {
-    getEncryptionKey();
-    await ensureSchema();
+    getEncryptionKey(); // validate key exists
 
-    const existing = await pool.query(
-      'SELECT 1 FROM ssh_accounts WHERE username = $1', [username]
-    );
-    if (existing.rowCount > 0 || getLinuxUid(username) !== null) {
+    const db = loadDb();
+    if (db[username] || getLinuxUid(username) !== null) {
       return { status: 'error', message: 'Username sudah digunakan.' };
     }
 
@@ -174,50 +209,34 @@ async function addAccount(username, password, ipAddress, userAgent) {
     setLinuxPassword(username, password);
 
     const encrypted = encryptPassword(password);
-    await pool.query(
-      `INSERT INTO ssh_accounts
-       (username, password_ciphertext, password_iv, password_tag, ip_address, user_agent)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [
-        username,
-        encrypted.password_ciphertext,
-        encrypted.password_iv,
-        encrypted.password_tag,
-        String(ipAddress || 'Unknown').slice(0, 255),
-        String(userAgent || 'Unknown').slice(0, 1000)
-      ]
-    );
+    db[username] = {
+      password_ciphertext: encrypted.password_ciphertext,
+      password_iv: encrypted.password_iv,
+      password_tag: encrypted.password_tag,
+      ip_address: String(ipAddress || 'Unknown').slice(0, 255),
+      user_agent: String(userAgent || 'Unknown').slice(0, 1000),
+      created_at: new Date().toISOString()
+    };
+
+    if (!saveDb(db)) {
+      // Rollback
+      try { deleteLinuxUser(username); } catch (_) {}
+      return { status: 'error', message: 'Gagal menyimpan ke DB file. Coba lagi.' };
+    }
 
     return { status: 'success', username, password };
   } catch (error) {
     if (createdLinuxUser) {
       try { deleteLinuxUser(username); } catch (_) {}
     }
-    if (error && error.code === '23505') {
-      return { status: 'error', message: 'Username sudah terdaftar.' };
-    }
     console.error('[SSH-STORE] Gagal membuat akun:', error.message);
-    return { status: 'error', message: 'Gagal membuat atau menyimpan akun SSH. Periksa log aplikasi.' };
+    return { status: 'error', message: `Gagal membuat akun: ${error.message}` };
   }
 }
 
 async function listAccounts(includePasswords = false) {
-  await ensureSchema();
-  const result = await pool.query(
-    'SELECT username, password_ciphertext, password_iv, password_tag, ip_address, user_agent, created_at FROM ssh_accounts ORDER BY created_at DESC'
-  );
-  const stored = new Map(result.rows.map(row => [row.username, row]));
+  const db = loadDb();
   const persistentUser = process.env.PERSISTENT_SSH_USER || '';
-
-  // Fallback metadata lama (transisi dari /tmp/ssh_details.json)
-  const tempMetadataPath = '/tmp/ssh_details.json';
-  let tempMetadata = {};
-  try {
-    if (fs.existsSync(tempMetadataPath)) {
-      const parsed = JSON.parse(fs.readFileSync(tempMetadataPath, 'utf8'));
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) tempMetadata = parsed;
-    }
-  } catch (_) {}
 
   // Safe read /etc/passwd
   let passwdContent = '';
@@ -232,11 +251,10 @@ async function listAccounts(includePasswords = false) {
     const shell = fields[fields.length - 1];
     if (!Number.isInteger(uid) || uid < 1000 || RESERVED_USERS.has(username.toLowerCase())) continue;
 
-    const row = stored.get(username);
-    const fallback = username === persistentUser ? (tempMetadata[username] || {}) : {};
+    const entry = db[username];
     let password = '-';
-    if (row && includePasswords) {
-      try { password = decryptPassword(row); }
+    if (entry && includePasswords) {
+      try { password = decryptPassword(entry); }
       catch (error) {
         console.error(`[SSH-STORE] Tidak dapat membuka password akun ${username}:`, error.message);
         password = '[tidak dapat dibuka: periksa SSH_CREDENTIALS_KEY]';
@@ -248,12 +266,18 @@ async function listAccounts(includePasswords = false) {
       uid,
       shell,
       password,
-      ip: row ? row.ip_address : (fallback.ip || 'Unknown'),
-      user_agent: row ? row.user_agent : (fallback.user_agent || 'Unknown'),
-      created_at: row ? row.created_at : null,
-      has_db_entry: !!row
+      ip: entry ? entry.ip_address : 'Unknown',
+      user_agent: entry ? entry.user_agent : 'Unknown',
+      created_at: entry ? entry.created_at : null,
+      has_db_entry: !!entry
     });
   }
+  // Sort by created_at DESC
+  users.sort((a, b) => {
+    const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
+    const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
+    return tb - ta;
+  });
   return { status: 'success', total: users.length, users };
 }
 
@@ -263,9 +287,8 @@ async function deleteAccount(username) {
   }
 
   try {
-    await ensureSchema();
-    const found = await pool.query('SELECT username FROM ssh_accounts WHERE username = $1', [username]);
-    if (found.rowCount === 0) {
+    const db = loadDb();
+    if (!db[username]) {
       return { status: 'error', message: 'Akun tidak ditemukan di database akun SSH.' };
     }
 
@@ -275,33 +298,32 @@ async function deleteAccount(username) {
       deleteLinuxUser(username);
     }
 
-    await pool.query('DELETE FROM ssh_accounts WHERE username = $1', [username]);
+    delete db[username];
+    if (!saveDb(db)) {
+      return { status: 'error', message: 'User dihapus dari sistem, tapi DB file gagal disimpan.' };
+    }
     return { status: 'success', message: `User ${username} berhasil dihapus!` };
   } catch (error) {
     console.error('[SSH-STORE] Gagal menghapus akun:', error.message);
-    return { status: 'error', message: 'Gagal menghapus akun SSH. Periksa log aplikasi.' };
+    return { status: 'error', message: `Gagal menghapus akun SSH: ${error.message}` };
   }
 }
 
 async function restoreAccounts() {
   getEncryptionKey();
-  await ensureSchema();
-  const result = await pool.query(
-    'SELECT username, password_ciphertext, password_iv, password_tag FROM ssh_accounts ORDER BY created_at ASC'
-  );
+  const db = loadDb();
+  const entries = Object.entries(db);
   let restored = 0;
   let alreadyPresent = 0;
   const failures = [];
   const persistentUser = process.env.PERSISTENT_SSH_USER || '';
 
-  for (const row of result.rows) {
-    const username = row.username;
-    // Per-user try/catch agar 1 user rusak tidak stop semua
+  for (const [username, entry] of entries) {
     try {
       if (!validateUsername(username) || username === persistentUser) {
         throw new Error('data tidak valid atau bertabrakan dengan akun utama');
       }
-      const password = decryptPassword(row);
+      const password = decryptPassword(entry);
       let uid = getLinuxUid(username);
 
       if (uid === null) {
@@ -320,11 +342,17 @@ async function restoreAccounts() {
     }
   }
 
-  return { total: result.rowCount, restored, alreadyPresent, failures };
+  return { total: entries.length, restored, alreadyPresent, failures };
+}
+
+async function ensureSchema() {
+  // No-op untuk file-based (auto-create saat saveDb)
+  return;
 }
 
 async function close() {
-  await pool.end();
+  // No-op untuk file-based
+  return;
 }
 
 // ========================================================
@@ -332,7 +360,9 @@ async function close() {
 // ========================================================
 module.exports = {
   addAccount, listAccounts, deleteAccount, restoreAccounts,
-  ensureSchema, close, validateUsername, validatePassword
+  ensureSchema, close, validateUsername, validatePassword,
+  // Expose untuk debugging
+  _paths: { DB_PATH, DB_BACKUP, DATA_DIR }
 };
 
 // ========================================================
@@ -345,24 +375,14 @@ if (require.main === module) {
     process.exit(2);
   }
   (async () => {
-    let lastError;
-    for (let attempt = 1; attempt <= 8; attempt++) {
-      try {
-        const summary = await restoreAccounts();
-        console.log(`[SSH-STORE] ✅ Restore selesai — total:${summary.total} created:${summary.restored} exists:${summary.alreadyPresent} failed:${summary.failures.length}`);
-        if (summary.failures.length > 0) console.error('[SSH-STORE] Failures:', summary.failures);
-        await close();
-        return;
-      } catch (error) {
-        lastError = error;
-        if (attempt < 8) {
-          console.error(`[SSH-STORE] DB belum siap (${attempt}/8): ${error.message}`);
-          await new Promise(r => setTimeout(r, 3000));
-        }
-      }
+    try {
+      const summary = await restoreAccounts();
+      console.log(`[SSH-STORE] ✅ Restore selesai — total:${summary.total} created:${summary.restored} exists:${summary.alreadyPresent} failed:${summary.failures.length}`);
+      if (summary.failures.length > 0) console.error('[SSH-STORE] Failures:', summary.failures);
+      return;
+    } catch (error) {
+      console.error('[SSH-STORE] ❌ PEMULIHAN GAGAL:', error.message);
+      process.exit(1);
     }
-    console.error('[SSH-STORE] ❌ PEMULIHAN GAGAL:', lastError ? lastError.message : 'Unknown');
-    try { await close(); } catch (_) {}
-    process.exit(1);
   })();
 }
